@@ -6,12 +6,15 @@
  *
  * NOTE: MPU-reassembly for MMT, TODO: move to MFU emmission to decoder buffer
  * 
- * global listener driver for LLS, MMT and ROUTE / DASH with refragmented http output on port 8888
+ * global listener driver for LLS, MMT and ROUTE / DASH with refragmented http output on port 8889
  *
  *
  * note: to use local playback with ffmpeg as the box is building (since we dont interlave samples fully), use:
- * 	ffplay  cache:http://127.0.0.1:8888/video.m4s -loglevel trace
+ * 	ffplay  cache:http://127.0.0.1:8889/video.m4s -loglevel trace
  *
+ * autoplay watches service_id 5001 by default (set ATSC3_AUTOPLAY_SERVICE_ID to override);
+ * tries MMT first, falls back to ROUTE/ALC (2026-09-20, since the original hardcoded
+ * MMT-only/service_id=3 autoplay never fires on a ROUTE-only broadcast)
  *
  */
 
@@ -99,91 +102,151 @@ extern atsc3_global_statistics_t* atsc3_global_statistics;
 #include <dirent.h>
 #include <microhttpd.h>
 #include <unistd.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <utility>
 
-#define PORT 8888
+#define PORT 8889
 
 #define FILENAME "test.mp4"
 #define MIMETYPE "video/mp4"
 
 #define PAGE "<html><head><title>File not found</title></head><body>File not found</body></html>"
 
+//jjustman-2019-09-18 original code hardcoded MMT here; our target broadcast is ROUTE-only.
+//Resolve whichever monitor (ALC/ROUTE or MMT) is actually active, so the HTTP path works for both.
+static lls_sls_monitor_output_buffer_mode_t* get_active_output_buffer_mode() {
+	if(lls_slt_monitor->lls_sls_alc_monitor) {
+		return &lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode;
+	}
+	if(lls_slt_monitor->lls_sls_mmt_monitor) {
+		return &lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode;
+	}
+	return NULL;
+}
+
 static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls, uint64_t pos, char *buf, size_t max)
 {
-	__INFO("http_output_response_from_player_pipe_reader_callback: enter: pos: %"PRIu64", buf: %p, max_size: %lu", pos, buf, max);
-	if(!lls_slt_monitor->lls_sls_mmt_monitor) {
-			__WARN("http_output_response_from_player_pipe_reader_callback: not lls_sls_mmt_monitor yet");
+	/*
+	 * 2026-09-20: this used to `return 0` from every "no data yet" branch
+	 * below. libmicrohttpd's content-reader callback has no defined
+	 * "nothing yet, call me again" return value - 0 is not
+	 * MHD_CONTENT_READER_END_OF_STREAM (-1), but in practice MHD treated
+	 * it as an early, clean end of the response anyway, which is exactly
+	 * what caused a real crash: a client (mpv, over the HTTP restream)
+	 * saw "End of file" and disconnected within seconds of connecting,
+	 * right when total_fragments_incoming_written was still small (an
+	 * ordinary startup race, not a real fault) - never fully returning
+	 * a video stream once the buffer had actually caught up moments
+	 * later. Retry in place instead, matching the same usleep-based
+	 * back-pressure pattern already used on the write side
+	 * (route_file_watcher_push_block_to_outputs) - only return once
+	 * there's real data to hand back.
+	 */
+	while(true) {
+		__INFO("http_output_response_from_player_pipe_reader_callback: enter: pos: %"PRIu64", buf: %p, max_size: %lu", pos, buf, max);
+
+		lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
+
+		if(!output_buffer_mode) {
+				__WARN("http_output_response_from_player_pipe_reader_callback: no active ALC or MMT monitor yet");
+				//sleep so we don't spinlock too fast
+				usleep(100000);
+				continue;
+			}
+		if(!output_buffer_mode->http_output_buffer) {
+			__WARN("http_output_response_from_player_pipe_reader_callback: not http_output_buffer yet");
 			//sleep so we don't spinlock too fast
 			usleep(100000);
-			return 0;
+			continue;
 		}
-	if(!lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer) {
-		__WARN("http_output_response_from_player_pipe_reader_callback: not http_output_buffer yet");
-		//sleep so we don't spinlock too fast
-		usleep(100000);
-		return 0;
-	}
-	lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_output_conntected = true;
-	if(!lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output &&
-			!lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_incoming) {
-		__WARN("http_output_response_from_player_pipe_reader_callback: both buffers are null, returning 0");
-		//sleep so we don't spinlock too fast
-		usleep(100000);
-		return 0;
-	}
-	if(!lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output &&
-			lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->total_fragments_incoming_written < 4) {
-			__WARN("http_output_response_from_player_pipe_reader_callback: total incoming fragments written is less than 4, returning 0 ");
+		output_buffer_mode->http_output_buffer->http_output_conntected = true;
+		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output &&
+				!output_buffer_mode->http_output_buffer->http_payload_buffer_incoming) {
+			__WARN("http_output_response_from_player_pipe_reader_callback: both buffers are null, retrying");
 			//sleep so we don't spinlock too fast
 			usleep(100000);
-			return 0;
+			continue;
+		}
+		//2026-09-20: this threshold assumes a real multi-item queue ("wait until several
+		//are buffered before starting playback"). http_payload_buffer_incoming is a
+		//single-slot mailbox, not a queue - route_file_watcher_run_thread already
+		//blocks each push until the previous one is consumed, so there's nothing to
+		//gain by waiting here, and with a threshold > 1 it deadlocks: the writer won't
+		//push item 2 until item 1 is read, but the reader won't read item 1 until 4
+		//items have been written.
+		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output &&
+				output_buffer_mode->http_output_buffer->total_fragments_incoming_written < 1) {
+				__WARN("http_output_response_from_player_pipe_reader_callback: no fragments written yet, retrying");
+				//sleep so we don't spinlock too fast
+				usleep(100000);
+				continue;
+			}
+
+		lls_sls_monitor_reader_mutex_lock(output_buffer_mode->http_output_buffer->http_payload_buffer_mutex);
+		//swap
+		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output && output_buffer_mode->http_output_buffer->http_payload_buffer_incoming) {
+			output_buffer_mode->http_output_buffer->http_payload_buffer_client_output = output_buffer_mode->http_output_buffer->http_payload_buffer_incoming;
+			output_buffer_mode->http_output_buffer->http_payload_buffer_incoming = NULL;
+			output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos = 0;
 		}
 
-	lls_sls_monitor_reader_mutex_lock(lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_mutex);
-	//swap
-	if(!lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output && lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_incoming) {
-		lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output = lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_incoming;
-		lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_incoming = NULL;
-		lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->i_pos = 0;
+		//2026-09-20: the checks above this mutex are unprotected reads, so a second
+		//concurrent connection (real segfault seen tonight: two ffplay connections
+		//racing on the same single-slot buffer via MHD_USE_THREAD_PER_CONNECTION) can
+		//get past them, then find both client_output and incoming NULL by the time it
+		//reaches here (the other connection's thread having just consumed and freed
+		//the only available block). This buffer is fundamentally single-client -
+		//retry instead of dereferencing NULL.
+		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output) {
+			lls_sls_monitor_reader_mutex_unlock(output_buffer_mode->http_output_buffer->http_payload_buffer_mutex);
+			usleep(100000);
+			continue;
+		}
+
+		//block copy accordingly
+		uint32_t block_pos = output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos;
+		uint32_t block_size = __MIN(max, output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_size - output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos);
+
+		__INFO("http_output_response_from_player_pipe_reader_callback: copying from %p, block_pos (i_pos): %u, block_size: %u, p_size: %u",
+				output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_buffer,
+				block_pos,
+				block_size,
+				output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_size);
+
+
+
+		memcpy(buf, &output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_buffer
+				[block_pos], block_size);
+		output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos += block_size;
+
+		if(output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos == output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_size) {
+			__INFO("http_output_response_from_player_pipe_reader_callback: end of output buffer, setting null");
+			block_Release(&output_buffer_mode->http_output_buffer->http_payload_buffer_client_output);
+
+		}
+
+		lls_sls_monitor_reader_mutex_unlock(output_buffer_mode->http_output_buffer->http_payload_buffer_mutex);
+
+		__INFO("http_output_response_from_player_pipe_reader_callback: return: returning size: %u, total incoming fragments written: %u", block_size, output_buffer_mode->http_output_buffer->total_fragments_incoming_written);
+
+		return block_size;
 	}
-
-	//block copy accordingly
-	uint32_t block_pos = lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->i_pos;
-	uint32_t block_size = __MIN(max, lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->p_size - lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->i_pos);
-
-	__INFO("http_output_response_from_player_pipe_reader_callback: copying from %p, block_pos (i_pos): %u, block_size: %u, p_size: %u",
-			lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->p_buffer,
-			block_pos,
-			block_size,
-			lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->p_size);
-
-
-
-	memcpy(buf, &lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->p_buffer
-			[block_pos], block_size);
-	lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->i_pos += block_size;
-
-	if(lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->i_pos == lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output->p_size) {
-		__INFO("http_output_response_from_player_pipe_reader_callback: end of output buffer, setting null");
-		block_Release(&lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_client_output);
-
-	}
-
-	lls_sls_monitor_reader_mutex_unlock(lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_mutex);
-
-	__INFO("http_output_response_from_player_pipe_reader_callback: return: returning size: %u, total incoming fragments written: %u", block_size, lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->total_fragments_incoming_written);
-
-	return block_size;
 }
 
 
 static void http_output_response_from_player_pipe_reader_free_callback (void *cls)
 {
-	lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_output_conntected = false;
+	lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
+	if(output_buffer_mode && output_buffer_mode->http_output_buffer) {
+		output_buffer_mode->http_output_buffer->http_output_conntected = false;
+	}
 	__INFO("http_output_response_from_player_pipe_reader_free_callback: closing: %p", cls);
 }
 
 
-static int http_output_response_from_player_pipe (void *cls,
+static enum MHD_Result http_output_response_from_player_pipe (void *cls,
           struct MHD_Connection *connection,
           const char *url,
           const char *method,
@@ -193,7 +256,7 @@ static int http_output_response_from_player_pipe (void *cls,
 {
 	static int aptr;
 	struct MHD_Response *response;
-	int ret;
+	enum MHD_Result ret;
 	FILE *file;
 	int fd;
 	//  DIR *dir;
@@ -224,8 +287,254 @@ static int http_output_response_from_player_pipe (void *cls,
 	return ret;
 }
 
+//jjustman-2019-09-18 original code only ever looked for an MMT session on a
+//hardcoded service_id of 3. Our target broadcast (Buffalo NY / Sinclair, 485MHz)
+//is ROUTE-only - no MMT anywhere on the mux - so that loop spun forever and
+//never set up the output/http buffers. Try MMT first (unchanged behavior for
+//2026-09-20: push a real on-disk fragment's bytes into both the local ffplay
+//pipe and the HTTP output buffer. Mirrors the locking pattern already used
+//elsewhere for each buffer (pipe_buffer_reader_mutex_lock/unlock + semaphore
+//post for ffplay; lls_sls_monitor_reader_mutex_lock/unlock for http).
+static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
+    if(!lls_slt_monitor->lls_sls_alc_monitor || !content_block) {
+        return;
+    }
+    lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = &lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode;
+
+    if(output_buffer_mode->ffplay_output_enabled && output_buffer_mode->pipe_ffplay_buffer) {
+        pipe_ffplay_buffer_t* pipe_ffplay_buffer = output_buffer_mode->pipe_ffplay_buffer;
+        pipe_buffer_reader_mutex_lock(pipe_ffplay_buffer);
+        pipe_buffer_unsafe_push_block(pipe_ffplay_buffer, content_block->p_buffer, content_block->p_size);
+        pipe_buffer_notify_semaphore_post(pipe_ffplay_buffer);
+        lls_slt_monitor_check_and_handle_pipe_ffplay_buffer_is_shutdown(lls_slt_monitor);
+        pipe_buffer_reader_mutex_unlock(pipe_ffplay_buffer);
+    }
+
+    if(output_buffer_mode->http_output_enabled && output_buffer_mode->http_output_buffer) {
+        http_output_buffer_t* http_output_buffer = output_buffer_mode->http_output_buffer;
+
+        //2026-09-20: http_payload_buffer_incoming is a single-slot mailbox, not a queue.
+        //Pushing a new fragment before the reader callback has consumed the previous one
+        //(swapped it into http_payload_buffer_client_output) silently block_Destroy()s
+        //and drops it - including, fatally, the init segment itself, since a burst of
+        //already-completed fragments on disk gets pushed with no delay between them.
+        //Block here until the previous one is actually picked up, so delivery to
+        //whichever client is connected is complete and in order.
+        while(true) {
+            lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
+            bool slot_free = !http_output_buffer->http_payload_buffer_incoming;
+            if(slot_free) {
+                http_output_buffer->http_payload_buffer_incoming = block_Duplicate(content_block);
+                http_output_buffer->total_fragments_incoming_written++;
+            }
+            lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
+            if(slot_free) {
+                break;
+            }
+            usleep(50000);
+        }
+    }
+}
+
+//2026-09-20: the "real" TSI-flow-to-buffer bridge (has_written_init_box /
+//should_flush_output_buffer, copy_video_init_block/copy_video_fragment_block)
+//is never wired up anywhere in this codebase (confirmed: zero callers for any
+//of it). But atsc3_alc_packet_persist_to_toi_resource_process_sls_mbms_and_emit_callback
+//DOES really work (once file_dump_enabled + certification_data are set - see
+//global_autoplay_run_thread below) and writes complete, valid, playable
+//ISOBMFF init/fragment files straight to route/<service_id>/ as real ROUTE
+//objects complete - see stsid.sls's afdt:fileTemplate for the naming
+//convention per flow. This thread bypasses the broken bridge entirely: watch
+//that directory for a chosen track's init segment + newly-arriving fragments
+//and push their real bytes directly into the ffplay pipe / http buffer.
+//Video (TSI 100 on this mux) doesn't work this way yet - real objects are ~2-3%
+//short of complete before giving up (no working FEC/repair-symbol recovery for
+//this large an object), so this currently only carries audio successfully.
+//Prefix/service_id are configurable via ATSC3_AUTOPLAY_TRACK_PREFIX (default
+//"a0-a02_2-", the first audio track) and ATSC3_AUTOPLAY_SERVICE_ID.
+void* route_file_watcher_run_thread(void* p) {
+    while(!lls_slt_monitor->lls_sls_alc_monitor || !lls_slt_monitor->lls_sls_alc_monitor->atsc3_lls_slt_service) {
+        sleep(1);
+    }
+    //give the persistence pipeline a head start so at least the init segment exists
+    sleep(5);
+
+    uint16_t service_id = lls_slt_monitor->lls_sls_alc_monitor->atsc3_lls_slt_service->service_id;
+    const char* prefix_env = getenv("ATSC3_AUTOPLAY_TRACK_PREFIX");
+    std::string prefix = prefix_env ? prefix_env : "a0-a02_2-";
+
+    char dir_path[256];
+    snprintf(dir_path, sizeof(dir_path), "route/%u", service_id);
+
+    std::string init_path = std::string(dir_path) + "/" + prefix + "init.mp4";
+
+    __INFO("route_file_watcher_run_thread: watching dir: %s, prefix: %s, waiting for init segment: %s",
+           dir_path, prefix.c_str(), init_path.c_str());
+
+    struct stat st;
+    while(stat(init_path.c_str(), &st) != 0) {
+        sleep(1);
+    }
+
+    block_t* init_block = block_Read_from_filename(init_path.c_str());
+    if(init_block) {
+        __INFO("route_file_watcher_run_thread: pushing init segment: %s, size: %d", init_path.c_str(), init_block->p_size);
+        route_file_watcher_push_block_to_outputs(init_block);
+        block_Destroy(&init_block);
+    } else {
+        __ERROR("route_file_watcher_run_thread: unable to read init segment: %s", init_path.c_str());
+    }
+
+    long last_toi_pushed = -1;
+
+    /*
+     * 2026-09-20: starting last_toi_pushed at -1 with no floor meant every
+     * fresh process start (and this tool has been restarted many times per
+     * session, with nothing ever deleting old fragments) replayed the
+     * *entire* accumulated backlog from the beginning before ever catching
+     * up to live - a real bug, not just disk bloat, confirmed live: "it's
+     * playing stuff from over an hour ago". Do one scan up front and skip
+     * to near the highest TOI already on disk minus a small buffer, so
+     * startup begins close to the live edge instead of replaying history.
+     */
+    {
+        std::vector<long> existing_tois;
+        DIR* d = opendir(dir_path);
+        if(d) {
+            struct dirent* entry;
+            while((entry = readdir(d))) {
+                std::string name = entry->d_name;
+                if(name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0) {
+                    size_t dot_pos = name.find('.', prefix.size());
+                    if(dot_pos != std::string::npos) {
+                        std::string toi_str = name.substr(prefix.size(), dot_pos - prefix.size());
+                        bool all_digit = !toi_str.empty();
+                        for(size_t i = 0; i < toi_str.size() && all_digit; i++) {
+                            if(!isdigit((unsigned char)toi_str[i])) all_digit = false;
+                        }
+                        if(all_digit) {
+                            existing_tois.push_back(atol(toi_str.c_str()));
+                        }
+                    }
+                }
+            }
+            closedir(d);
+        }
+        if(!existing_tois.empty()) {
+            long max_toi = *std::max_element(existing_tois.begin(), existing_tois.end());
+            const long __STARTUP_LIVE_EDGE_BACKLOG = 5;
+            last_toi_pushed = __MAX(-1L, max_toi - __STARTUP_LIVE_EDGE_BACKLOG);
+            __INFO("route_file_watcher_run_thread: skipping backlog on startup, max_toi on disk: %ld, starting from: %ld", max_toi, last_toi_pushed);
+        }
+    }
+
+    time_t last_cleanup_time = 0;
+    //2026-09-20: user-requested - nothing ever deleted old fragments, so disk
+    //usage grows unbounded over a long-running session. Age-based (not
+    //TOI-based) so it applies uniformly to every track's files in this
+    //directory (video/audio/subtitle each use different prefixes/extensions),
+    //not just the one this thread happens to be watching.
+    const time_t __FRAGMENT_RETENTION_SECONDS = 300;
+    const time_t __CLEANUP_INTERVAL_SECONDS = 60;
+
+    while(true) {
+        //2026-09-20: different flows use different fragment extensions per their
+        //own afdt:fileTemplate (audio: .m4s, video: .mp4v) - match the numeric TOI
+        //regardless of extension and keep the real filename, rather than assuming .m4s.
+        std::vector<std::pair<long, std::string>> tois;
+        DIR* d = opendir(dir_path);
+        if(d) {
+            struct dirent* entry;
+            while((entry = readdir(d))) {
+                std::string name = entry->d_name;
+                if(name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0) {
+                    size_t dot_pos = name.find('.', prefix.size());
+                    if(dot_pos != std::string::npos) {
+                        std::string toi_str = name.substr(prefix.size(), dot_pos - prefix.size());
+                        bool all_digit = !toi_str.empty();
+                        for(size_t i = 0; i < toi_str.size() && all_digit; i++) {
+                            if(!isdigit((unsigned char)toi_str[i])) all_digit = false;
+                        }
+                        if(all_digit) {
+                            tois.push_back(std::make_pair(atol(toi_str.c_str()), name));
+                        }
+                    }
+                }
+            }
+            closedir(d);
+        }
+        std::sort(tois.begin(), tois.end());
+
+        for(size_t i = 0; i < tois.size(); i++) {
+            if(tois[i].first > last_toi_pushed) {
+                char frag_path[512];
+                snprintf(frag_path, sizeof(frag_path), "%s/%s", dir_path, tois[i].second.c_str());
+                block_t* frag_block = block_Read_from_filename(frag_path);
+                if(frag_block) {
+                    __INFO("route_file_watcher_run_thread: pushing fragment: %s, size: %d", frag_path, frag_block->p_size);
+                    route_file_watcher_push_block_to_outputs(frag_block);
+                    block_Destroy(&frag_block);
+                    last_toi_pushed = tois[i].first;
+                } else {
+                    __WARN("route_file_watcher_run_thread: unable to read fragment (may still be mid-write): %s", frag_path);
+                }
+            }
+        }
+
+        time_t now = time(NULL);
+        if(now - last_cleanup_time >= __CLEANUP_INTERVAL_SECONDS) {
+            last_cleanup_time = now;
+            int cleaned = 0;
+            DIR* cleanup_d = opendir(dir_path);
+            if(cleanup_d) {
+                struct dirent* entry;
+                while((entry = readdir(cleanup_d))) {
+                    std::string name = entry->d_name;
+                    if(name == "." || name == "..") continue;
+                    //never delete init segments - they're small, needed for
+                    //the lifetime of the process, and not part of the churn
+                    if(name.find("init.mp4") != std::string::npos) continue;
+                    char full_path[512];
+                    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name.c_str());
+                    struct stat cleanup_st;
+                    if(stat(full_path, &cleanup_st) == 0 && (now - cleanup_st.st_mtime) > __FRAGMENT_RETENTION_SECONDS) {
+                        if(unlink(full_path) == 0) {
+                            cleaned++;
+                        }
+                    }
+                }
+                closedir(cleanup_d);
+            }
+            if(cleaned) {
+                __INFO("route_file_watcher_run_thread: cleanup pass removed %d fragment(s) older than %lds from %s", cleaned, __FRAGMENT_RETENTION_SECONDS, dir_path);
+            }
+        }
+
+        sleep(1);
+    }
+
+    return NULL;
+}
+
+//jjustman-2019-09-18 original code only ever looked for an MMT session on a
+//hardcoded service_id of 3. Our target broadcast (Buffalo NY / Sinclair, 485MHz)
+//is ROUTE-only - no MMT anywhere on the mux - so that loop spun forever and
+//never set up the output/http buffers. Try MMT first (unchanged behavior for
+//any MMT broadcast), then fall back to ROUTE/ALC using the same session
+//resolution the interactive ncurses tool's 's' key handler already uses
+//successfully (atsc3_output_statistics_ncurses.c) - the "official" ALC
+//session vector is never populated anywhere in this codebase, so we build
+//the session directly from the SLT's own already-parsed broadcast_svc_signalling.
+//Service id is configurable via ATSC3_AUTOPLAY_SERVICE_ID env var (default 5001,
+//WNYO on this mux) instead of the old hardcoded 3.
 void* global_autoplay_run_thread(void*p) {
-    uint16_t my_service_id = 3;
+    uint16_t my_service_id = 5001;
+    const char* service_id_env = getenv("ATSC3_AUTOPLAY_SERVICE_ID");
+    if(service_id_env) {
+        my_service_id = (uint16_t) atoi(service_id_env);
+    }
+    __INFO("global_autoplay_run_thread: watching for service_id: %u (set ATSC3_AUTOPLAY_SERVICE_ID to override)", my_service_id);
+
     lls_sls_mmt_monitor_t* lls_sls_mmt_monitor = NULL;
 
     while(true) {
@@ -236,25 +545,88 @@ void* global_autoplay_run_thread(void*p) {
             lls_sls_mmt_monitor->transients.lls_mmt_session = lls_sls_mmt_session;
             //TODO - jjustman-2019-10-03 - fix this hack
             lls_sls_mmt_monitor->transients.atsc3_lls_slt_service = lls_sls_mmt_session->atsc3_lls_slt_service;
-            
+
 //            lls_sls_mmt_monitor->video_packet_id = lls_sls_mmt_session->video_packet_id;
 //            lls_sls_mmt_monitor->audio_packet_id = lls_sls_mmt_session->audio_packet_id;
-            
+
             lls_sls_mmt_monitor->lls_sls_monitor_output_buffer.has_written_init_box = false;
             lls_slt_monitor->lls_sls_mmt_monitor = lls_sls_mmt_monitor;
             sleep(3);
 
             lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.pipe_ffplay_buffer = pipe_create_ffplay_resolve_fps(&lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer.video_output_buffer_isobmff);
-            
+
             lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.ffplay_output_enabled = true;
-            
+
             lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer = (http_output_buffer_t*)calloc(1, sizeof(http_output_buffer_t));
             lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_mutex = lls_sls_monitor_reader_mutext_create();
             lls_slt_monitor->lls_sls_mmt_monitor->lls_sls_monitor_output_buffer_mode.http_output_enabled = true;
             break;
         }
+
+        //no MMT session for this service_id - try resolving a ROUTE/ALC session instead
+        lls_sls_alc_session_t* lls_sls_alc_session = lls_slt_alc_session_find_from_service_id(lls_slt_monitor, my_service_id);
+
+        if(!lls_sls_alc_session) {
+            atsc3_lls_slt_service_t* atsc3_lls_slt_service_for_session =
+                lls_slt_monitor_find_lls_slt_service_id_group_id_cache_entry(lls_slt_monitor, my_service_id);
+
+            if(atsc3_lls_slt_service_for_session) {
+                for(int svc_sig_i = 0; svc_sig_i < atsc3_lls_slt_service_for_session->atsc3_slt_broadcast_svc_signalling_v.count; svc_sig_i++) {
+                    atsc3_slt_broadcast_svc_signalling_t* svc_signalling =
+                        atsc3_lls_slt_service_for_session->atsc3_slt_broadcast_svc_signalling_v.data[svc_sig_i];
+
+                    if(svc_signalling && svc_signalling->sls_destination_ip_address && svc_signalling->sls_destination_udp_port) {
+                        uint32_t dest_ip = parseIpAddressIntoIntval(svc_signalling->sls_destination_ip_address);
+                        uint16_t dest_port = (uint16_t) atoi(svc_signalling->sls_destination_udp_port);
+                        uint32_t source_ip = svc_signalling->sls_source_ip_address ?
+                            parseIpAddressIntoIntval(svc_signalling->sls_source_ip_address) : 0;
+
+                        lls_sls_alc_session = lls_slt_alc_session_find_or_create_from_ip_udp_values(
+                            lls_slt_monitor, atsc3_lls_slt_service_for_session, dest_ip, dest_port, source_ip);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if(lls_sls_alc_session) {
+            __INFO("global_autoplay_run_thread: resolved ROUTE/ALC session for service_id: %u", my_service_id);
+
+            lls_sls_alc_monitor_t* lls_sls_alc_monitor = lls_sls_alc_monitor_create();
+            lls_sls_alc_monitor->lls_alc_session = lls_sls_alc_session;
+            lls_sls_alc_monitor->atsc3_lls_slt_service = lls_sls_alc_session->atsc3_lls_slt_service;
+            lls_sls_alc_monitor->lls_sls_monitor_output_buffer.has_written_init_box = false;
+            lls_slt_monitor->lls_sls_alc_monitor = lls_sls_alc_monitor;
+            sleep(3);
+
+            //2026-09-20: atsc3_lls_slt_monitor_update_monitors_from_latest_certification_data_table()
+            //only wires this up for monitors registered in lls_sls_alc_monitor_v - our monitor is a
+            //standalone one assigned directly to lls_slt_monitor->lls_sls_alc_monitor, so it's invisible
+            //to that mechanism. Without this, atsc3_cms_validate_from_context() always fails immediately
+            //(transients.atsc3_certification_data NULL), which silently blocks all ALC object completion
+            //processing (signaling AND media) via atsc3_alc_packet_persist_to_toi_resource_process_sls_mbms_and_emit_callback.
+            if(lls_slt_monitor->lls_latest_certification_data_table) {
+                lls_slt_monitor->lls_sls_alc_monitor->transients.atsc3_certification_data = &lls_slt_monitor->lls_latest_certification_data_table->certification_data;
+            } else {
+                __WARN("global_autoplay_run_thread: lls_latest_certification_data_table not yet available, CMS/smime validation will fail until it arrives");
+            }
+
+            lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.pipe_ffplay_buffer = pipe_create_ffplay_resolve_fps(&lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer.video_output_buffer_isobmff);
+
+            lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.ffplay_output_enabled = true;
+
+            //2026-09-20: atsc3_alc_packet_persist_to_toi_resource_process_sls_mbms_and_emit_callback()
+            //bails out immediately unless this is set - without it, NOTHING in the ALC object
+            //completion/persistence pipeline ever runs, for any object type, video included.
+            lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.file_dump_enabled = true;
+
+            lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer = (http_output_buffer_t*)calloc(1, sizeof(http_output_buffer_t));
+            lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer->http_payload_buffer_mutex = lls_sls_monitor_reader_mutext_create();
+            lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.http_output_enabled = true;
+            break;
+        }
     }
-    
+
     return NULL;
 }
 
@@ -401,40 +773,60 @@ static void route_process_from_alc_packet(udp_flow_t* udp_flow, atsc3_alc_packet
 	}
     
     if(lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer.has_written_init_box && lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer.should_flush_output_buffer) {
-//
-//    	lls_sls_monitor_output_buffer_t* lls_sls_monitor_output_buffer_final_muxed_payload = atsc3_isobmff_build_joined_alc_isobmff_fragment(&lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer);
-//
-//		if(!lls_sls_monitor_output_buffer_final_muxed_payload) {
-//			lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer.should_flush_output_buffer = false;
-//			__ERROR("lls_sls_monitor_output_buffer_final_muxed_payload was NULL!");
-//			return;
-//		}
-//
-//        if(lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.ffplay_output_enabled && lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.pipe_ffplay_buffer) {
-//
-//        	pipe_ffplay_buffer_t* pipe_ffplay_buffer = lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.pipe_ffplay_buffer;
-//
-//        	pipe_buffer_reader_mutex_lock(pipe_ffplay_buffer);
-//        
-//        	pipe_buffer_unsafe_push_block(pipe_ffplay_buffer, lls_sls_monitor_output_buffer_final_muxed_payload->joined_isobmff_block->p_buffer, lls_sls_monitor_output_buffer_final_muxed_payload->joined_isobmff_block->i_pos);
-//        
-//        	pipe_buffer_notify_semaphore_post(pipe_ffplay_buffer);
-//        
-//			//check to see if we have shutdown
-//			lls_slt_monitor_check_and_handle_pipe_ffplay_buffer_is_shutdown(lls_slt_monitor);
-//
-//			pipe_buffer_reader_mutex_unlock(pipe_ffplay_buffer);
-//			//reset our buffer pos and should_flush = false;
-//        }
-//
-//        if(true || lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.file_dump_enabled) {
-//        	//don't double write to disk for route objects as we do this already in the route alc refrag client
-//            lls_sls_monitor_output_buffer_alc_file_dump(lls_sls_monitor_output_buffer_final_muxed_payload, "route/",
-//            		lls_slt_monitor->lls_sls_alc_monitor->last_completed_flushed_audio_toi,
-//					lls_slt_monitor->lls_sls_alc_monitor->last_completed_flushed_video_toi);
-//        }
-//
-//		lls_sls_monitor_output_buffer_reset_moof_and_fragment_position(&lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer);
+
+    	lls_sls_monitor_output_buffer_t* lls_sls_monitor_output_buffer_final_muxed_payload = atsc3_isobmff_build_joined_alc_isobmff_fragment(&lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer);
+
+		if(!lls_sls_monitor_output_buffer_final_muxed_payload) {
+			lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer.should_flush_output_buffer = false;
+			__ERROR("lls_sls_monitor_output_buffer_final_muxed_payload was NULL!");
+			return;
+		}
+
+        if(lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.ffplay_output_enabled && lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.pipe_ffplay_buffer) {
+
+        	pipe_ffplay_buffer_t* pipe_ffplay_buffer = lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.pipe_ffplay_buffer;
+
+        	pipe_buffer_reader_mutex_lock(pipe_ffplay_buffer);
+
+        	pipe_buffer_unsafe_push_block(pipe_ffplay_buffer, lls_sls_monitor_output_buffer_final_muxed_payload->joined_isobmff_block->p_buffer, lls_sls_monitor_output_buffer_final_muxed_payload->joined_isobmff_block->i_pos);
+
+        	pipe_buffer_notify_semaphore_post(pipe_ffplay_buffer);
+
+			//check to see if we have shutdown
+			lls_slt_monitor_check_and_handle_pipe_ffplay_buffer_is_shutdown(lls_slt_monitor);
+
+			pipe_buffer_reader_mutex_unlock(pipe_ffplay_buffer);
+			//reset our buffer pos and should_flush = false;
+        }
+
+		//2026-09-20: this half of the pipeline (HTTP remote delivery) never existed even
+		//commented-out - the original author only ever wired the local ffplay pipe above.
+		//Mirror the same push into http_output_buffer so a remote client (ffplay/VLC over
+		//http://<host>:8889/) gets the same joined ISOBMFF fragments.
+		http_output_buffer_t* http_output_buffer = lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.http_output_buffer;
+		if(lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.http_output_enabled && http_output_buffer) {
+
+			lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
+
+			if(http_output_buffer->http_payload_buffer_incoming) {
+				//previous fragment wasn't picked up by the reader callback yet - drop it
+				//in favor of the newest one rather than let unbounded backlog build up
+				block_Destroy(&http_output_buffer->http_payload_buffer_incoming);
+			}
+			http_output_buffer->http_payload_buffer_incoming = block_Duplicate(lls_sls_monitor_output_buffer_final_muxed_payload->joined_isobmff_block);
+			http_output_buffer->total_fragments_incoming_written++;
+
+			lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
+		}
+
+        if(true || lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode.file_dump_enabled) {
+        	//don't double write to disk for route objects as we do this already in the route alc refrag client
+            lls_sls_monitor_output_buffer_alc_file_dump(lls_sls_monitor_output_buffer_final_muxed_payload, "route/",
+            		lls_slt_monitor->lls_sls_alc_monitor->last_completed_flushed_audio_toi,
+					lls_slt_monitor->lls_sls_alc_monitor->last_completed_flushed_video_toi);
+        }
+
+		lls_sls_monitor_output_buffer_reset_moof_and_fragment_position(&lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer);
     }
 }
 
@@ -588,6 +980,17 @@ void* pcap_loop_run_thread(void* dev_pointer) {
 
     if(descr == NULL) {
         printf("pcap_open_live(): %s",errbuf);
+        exit(1);
+    }
+
+    //alp0 (and other ALP-decapsulating netdevs) hand up bare IP with no L2 header (DLT_RAW);
+    //process_packet_from_pcap() defaults to assuming DLT_EN10MB (Ethernet), so tell it otherwise
+    //(port of the same fix already applied to atsc3_listener_metrics_ncurses.cpp)
+    int datalink = pcap_datalink(descr);
+    if (datalink == DLT_RAW) {
+        atsc3_listener_udp_set_l2_header_len(0);
+    } else if (datalink != DLT_EN10MB) {
+        fprintf(stderr, "pcap_loop_run_thread: unsupported pcap datalink type: %d, expected DLT_EN10MB or DLT_RAW\n", datalink);
         exit(1);
     }
 
@@ -772,10 +1175,14 @@ int main(int argc,char **argv) {
 	int pcap_ret = pthread_create(&global_pcap_thread_id, NULL, pcap_loop_run_thread, (void*)dev);
 	assert(!pcap_ret);
 
-#ifdef __LIBATSC3_AUTOPLAY__
-    pthread_t global_autoplay_thread_id;
-    pthread_create(&global_autoplay_thread_id, NULL, global_autoplay_run_thread, NULL);
-#endif
+	//jjustman's original code gated this behind __LIBATSC3_AUTOPLAY__, which is
+	//never defined anywhere in the build (no -D flag in the makefile) - so this
+	//thread, and the ROUTE/ALC fallback added to it above, never actually ran.
+	pthread_t global_autoplay_thread_id;
+	pthread_create(&global_autoplay_thread_id, NULL, global_autoplay_run_thread, NULL);
+
+	pthread_t global_route_file_watcher_thread_id;
+	pthread_create(&global_route_file_watcher_thread_id, NULL, route_file_watcher_run_thread, NULL);
 
 	pthread_join(global_pcap_thread_id, NULL);
 	pthread_join(global_ncurses_input_thread_id, NULL);

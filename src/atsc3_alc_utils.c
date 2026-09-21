@@ -72,7 +72,7 @@ RFC 5775               ALC Protocol Instantiation             April 2010
 
 #include "atsc3_route_package_utils.h"
 
-int _ALC_UTILS_INFO_ENABLED=0;
+int _ALC_UTILS_INFO_ENABLED=1;
 int _ALC_UTILS_DEBUG_ENABLED=0;
 int _ALC_UTILS_TRACE_ENABLED=0;
 int _ALC_UTILS_IOTRACE_ENABLED=0;

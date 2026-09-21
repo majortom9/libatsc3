@@ -19,28 +19,40 @@ typedef struct atsc3_udp_reassembly_buffer {
 
 atsc3_udp_reassembly_buffer_t atsc3_udp_reassembly_buffer = { '0' };
 
+//default assumes a DLT_EN10MB (Ethernet) pcap capture; call atsc3_listener_udp_set_l2_header_len()
+//with the value from pcap_datalink() when capturing on a non-Ethernet link (e.g. DLT_RAW==0 for
+//ALP-decapsulating netdevs like alp0, which hand up bare IP with no L2 header at all)
+int atsc3_listener_udp_l2_header_len = 14;
+
+void atsc3_listener_udp_set_l2_header_len(int l2_header_len) {
+	atsc3_listener_udp_l2_header_len = l2_header_len;
+}
+
 udp_packet_t* process_packet_from_pcap(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
 	int i = 0;
 	int k = 0;
 	u_char ethernet_packet[14];
 	u_char ip_header[24];
 	u_char udp_header[8];
-	int udp_header_start = 34;
+	int l2_header_len = atsc3_listener_udp_l2_header_len;
+	int udp_header_start = l2_header_len + 20;
 
 	udp_packet_t* udp_packet = NULL;
 	uint32_t data_length = 0;
 
-	for (i = 0; i < 14; i++) {
-		ethernet_packet[i] = packet[0 + i];
-	}
-	//workaround for airwavz pcaps with ethertype=0xc0a8
-    if (!(ethernet_packet[12] == 0x08 && ethernet_packet[13] == 0x00)) {
-        __LISTENER_UDP_ERROR("udp_packet_process_from_ptr: invalid ethernet frame, expected 0x08 0x00, ethernet_packet[12]=0x%02x, [13]=0x%02x", ethernet_packet[12], ethernet_packet[13]);
-		return NULL;
+	if (l2_header_len >= 14) {
+		for (i = 0; i < 14; i++) {
+			ethernet_packet[i] = packet[0 + i];
+		}
+		//workaround for airwavz pcaps with ethertype=0xc0a8
+		if (!(ethernet_packet[12] == 0x08 && ethernet_packet[13] == 0x00)) {
+			__LISTENER_UDP_ERROR("udp_packet_process_from_ptr: invalid ethernet frame, expected 0x08 0x00, ethernet_packet[12]=0x%02x, [13]=0x%02x", ethernet_packet[12], ethernet_packet[13]);
+			return NULL;
+		}
 	}
 
 	for (i = 0; i < 20; i++) {
-        ip_header[i] = packet[14 + i];
+        ip_header[i] = packet[l2_header_len + i];
 	}
 
 	//check if we are a UDP packet, otherwise bail
@@ -50,7 +62,7 @@ udp_packet_t* process_packet_from_pcap(u_char *user, const struct pcap_pkthdr *p
 	}
 
 	if ((ip_header[0] & 0x0F) > 5) {
-		udp_header_start = 48;
+		udp_header_start = l2_header_len + 34;
 	}
 
 	//malloc our udp_packet_header:

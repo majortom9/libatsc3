@@ -56,6 +56,8 @@ extern "C" {
 
 
 udp_packet_t* process_packet_from_pcap(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet);
+//set to the value of pcap_datalink() on the capture handle: 14 for DLT_EN10MB (default), 0 for DLT_RAW
+void atsc3_listener_udp_set_l2_header_len(int l2_header_len);
 
 udp_packet_t* udp_packet_process_from_raw_ethernet_block_t(block_t* raw_blockt);
 udp_packet_t* udp_packet_process_from_ptr_raw_ethernet_packet(uint8_t* packet, uint32_t packet_length);

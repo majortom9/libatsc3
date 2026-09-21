@@ -18,6 +18,7 @@ extern "C" {
 #include "atsc3_alc_utils.h"
 #include "atsc3_output_statistics_ncurses_windows.h"
 #include "atsc3_lls_sls_monitor_output_buffer_utils.h"
+#include "atsc3_lls_alc_utils.h"
 
 pthread_mutex_t ncurses_writer_lock;
 int initfunc(WINDOW* ripoff_win, int cols) {
@@ -227,6 +228,39 @@ void* ncurses_input_run_thread(void* lls_slt_monitor_ptr) {
 					//find our matching lls_sls and create a monitor entry
 
 					lls_sls_alc_session_t* lls_sls_alc_session = lls_slt_alc_session_find_from_service_id(lls_slt_monitor, my_service_id);
+
+					if(!lls_sls_alc_session) {
+						//jjustman-2020-11-17's TODO ("add lls_sls_alc_session_flows_v", see
+						//atsc3_core_service_player_bridge.cpp) was never finished - that vector
+						//is never populated anywhere in this codebase, so the lookup above always
+						//returns NULL, silently, for every service. Build the session directly
+						//from the SLT's own already-parsed broadcast_svc_signalling (source/dest
+						//ip + dest port), which the SLT parser does populate correctly.
+						atsc3_lls_slt_service_t* atsc3_lls_slt_service_for_session =
+							lls_slt_monitor_find_lls_slt_service_id_group_id_cache_entry(lls_slt_monitor, my_service_id);
+
+						if(atsc3_lls_slt_service_for_session) {
+							for(int svc_sig_i = 0; svc_sig_i < atsc3_lls_slt_service_for_session->atsc3_slt_broadcast_svc_signalling_v.count; svc_sig_i++) {
+								atsc3_slt_broadcast_svc_signalling_t* svc_signalling =
+									atsc3_lls_slt_service_for_session->atsc3_slt_broadcast_svc_signalling_v.data[svc_sig_i];
+
+								if(svc_signalling && svc_signalling->sls_destination_ip_address && svc_signalling->sls_destination_udp_port) {
+									uint32_t dest_ip = parseIpAddressIntoIntval(svc_signalling->sls_destination_ip_address);
+									uint16_t dest_port = (uint16_t) atoi(svc_signalling->sls_destination_udp_port);
+									uint32_t source_ip = svc_signalling->sls_source_ip_address ?
+										parseIpAddressIntoIntval(svc_signalling->sls_source_ip_address) : 0;
+
+									lls_sls_alc_session = lls_slt_alc_session_find_or_create_from_ip_udp_values(
+										lls_slt_monitor, atsc3_lls_slt_service_for_session, dest_ip, dest_port, source_ip);
+									break;
+								}
+							}
+						}
+
+						if(!lls_sls_alc_session) {
+							wprintw(my_window, ", unable to resolve ALC session from SLT broadcast_svc_signalling!");
+						}
+					}
 
 					if(lls_sls_alc_session) {
                         //TODO - free and teardown if we already have an active monitoring

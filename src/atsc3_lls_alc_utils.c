@@ -202,12 +202,17 @@ lls_sls_alc_session_t* lls_slt_alc_session_find(lls_slt_monitor_t* lls_slt_monit
 		}
 	}
 
-    lls_slt_monitor->lls_sls_alc_monitor = NULL;
+    //2026-09-20: this used to unconditionally NULL lls_slt_monitor->lls_sls_alc_monitor
+    //here just because THIS particular service_id/ip/port combination didn't match -
+    //that destroys a legitimate, actively-in-use monitor (e.g. one set up by
+    //global_autoplay_run_thread) the moment any OTHER service's signaling gets
+    //processed. This function's job is to find a session for the given args; it
+    //has no business tearing down unrelated global state on a miss.
     return NULL;
 }
 
 /*
- 
+
  jjustman-2020-03-25 - workaround warning: set our lls_slt_monitor->lls_sls_alc_monitor if we have a matching session
  TODO: deprecate this method and instead use atsc3_lls_sls_alc_monitor_find_from_udp_packet(0
  
@@ -262,7 +267,30 @@ lls_sls_alc_session_t* lls_slt_alc_session_find_from_udp_packet(lls_slt_monitor_
 		}
 	}
 
-    lls_slt_monitor->lls_sls_alc_monitor = NULL;
+	//jjustman-2020-11-17's TODO ("add lls_sls_alc_session_flows_v") was never finished,
+	//so the vector search above never matches a session built via
+	//lls_slt_alc_session_find_or_create_from_ip_udp_values() (e.g. from the ncurses 's'
+	//key handler) - that path only ever sets lls_slt_monitor->lls_sls_alc_monitor
+	//directly, never adds anything to lls_sls_alc_session_flows_v. Fall back to
+	//checking the single active monitor's session directly so real-time packet
+	//dispatch can actually find it.
+	if(lls_slt_monitor->lls_sls_alc_monitor && lls_slt_monitor->lls_sls_alc_monitor->lls_alc_session) {
+		lls_sls_alc_session_t* lls_sls_alc_session_fallback = lls_slt_monitor->lls_sls_alc_monitor->lls_alc_session;
+
+		if((lls_sls_alc_session_fallback->sls_relax_source_ip_check || (!lls_sls_alc_session_fallback->sls_relax_source_ip_check && lls_sls_alc_session_fallback->sls_source_ip_address == src_ip_addr)) &&
+				lls_sls_alc_session_fallback->sls_destination_ip_address == dst_ip_addr && lls_sls_alc_session_fallback->sls_destination_udp_port == dst_port) {
+			return lls_sls_alc_session_fallback;
+		}
+	}
+
+    //2026-09-20: this function is called for EVERY incoming ALC packet across every
+    //flow on the mux, not just the one we're monitoring. Unconditionally NULLing
+    //lls_slt_monitor->lls_sls_alc_monitor here on ANY non-matching packet destroyed
+    //a legitimate, actively-in-use monitor (e.g. one set up by
+    //global_autoplay_run_thread) the instant a packet for some other service came
+    //in - which is most packets, on a multi-service mux. A miss here just means
+    //this packet isn't for a known session; it says nothing about whether our
+    //existing monitor is still valid.
 	return NULL;
 }
 

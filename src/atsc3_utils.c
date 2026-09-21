@@ -6,6 +6,7 @@
  */
 
 #include "atsc3_utils.h"
+#include <arpa/inet.h>
 
 int _ATSC3_UTILS_INFO_ENABLED = 0;
 int _ATSC3_UTILS_DEBUG_ENABLED = 0;

@@ -2050,6 +2050,7 @@ tools/atsc3_listener_metrics_ncurses: tools/atsc3_listener_metrics_ncurses.cpp \
 								atsc3_output_statistics_ncurses.h \
 								atsc3_output_statistics_ncurses.c \
 								atsc3_mmt_reconstitution_from_media_sample.o \
+								atsc3_isobmff_tools.o \
 								atsc3_logging_externs.o \
 								libatsc3.o
 
@@ -2058,9 +2059,11 @@ tools/atsc3_listener_metrics_ncurses: tools/atsc3_listener_metrics_ncurses.cpp \
 			atsc3_bandwidth_statistics.c \
 			atsc3_packet_statistics.c \
 			atsc3_mmt_reconstitution_from_media_sample.c \
+			atsc3_isobmff_tools.o \
 			atsc3_logging_externs.o \
 			libatsc3.o \
 			-I../bento/include/ \
+			-L../bento/lib -lap4 \
 			$(LOCAL_LD_LIBS_NCURSES) \
 			$(LOCAL_LD_LIBS_OPENSSL) \
 			-o tools/atsc3_listener_metrics_ncurses
@@ -2071,6 +2074,7 @@ tools/atsc3_listener_metrics_ncurses_httpd_isobmff: tools/atsc3_listener_metrics
 								atsc3_output_statistics_ncurses.h \
 								atsc3_output_statistics_ncurses.c  \
 								atsc3_mmt_reconstitution_from_media_sample.o \
+								atsc3_isobmff_tools.o \
 								atsc3_logging_externs.o \
 								libatsc3.o
 
@@ -2080,8 +2084,10 @@ tools/atsc3_listener_metrics_ncurses_httpd_isobmff: tools/atsc3_listener_metrics
 			atsc3_bandwidth_statistics.c \
 			atsc3_packet_statistics.c \
 			atsc3_mmt_reconstitution_from_media_sample.c \
+			atsc3_isobmff_tools.o \
 			atsc3_logging_externs.o \
 			-I../bento/include/ \
+			-L../bento/lib -lap4 \
 			$(LOCAL_LD_LIBS_NCURSES) \
 			$(LOCAL_LD_LIBS_OPENSSL) \
 			-I../libmicrohttpd/libmicrohttpd-0.9.63/build/include \

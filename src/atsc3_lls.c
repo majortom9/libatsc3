@@ -54,7 +54,10 @@ int _LLS_INFO_ENABLED  = 0;
 int _LLS_DEBUG_ENABLED = 0;
 int _LLS_TRACE_ENABLED = 0;
 
-int __DISABLE_LLS_SIGNEDMULTITABLE_VALIDATION__ = 0;
+//no CMS certificate chain is provisioned in this build (the private A/360 cert
+//submodules aren't available), so SignedMultiTable verification can never succeed;
+//skip it and use the signaling content as-is
+int __DISABLE_LLS_SIGNEDMULTITABLE_VALIDATION__ = 1;
 
 char* LLS_SERVICE_CATEGORY_VALUES[] = {"atsc reserved", "linear av", "linear audio", "app based svc.", "esg service", "eas service", "certificateData", "atsc other" };
 //jjustman-2020-03-10: note: 0xFE=>"SignedMultiTable", 0xFF=>"UserDefined"

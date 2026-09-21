@@ -6,6 +6,9 @@
  */
 
 #include "atsc3_lls_types.h"
+#include "atsc3_alc_utils.h"
+#include "atsc3_route_s_tsid.h"
+#include "atsc3_udp.h"
 
 int _LLS_TYPES_INFO_ENABLED = 1;
 int _LLS_TYPES_DEBUG_ENABLED = 0;
@@ -499,7 +502,12 @@ void atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects
 
 					//has given up flow - _ATSC3_LLS_SLS_ALC_MONITOR_LCT_PACKETS_GIVEN_UP_SECONDS
 					if(!should_free_and_unlink && atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received) {
-					    long atsc3_route_object_given_up_duration = now - atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received->most_recent_received_timestamp;
+					    //2026-09-20: snapshot this now - a successful best-effort persist below can free
+					    //atsc3_route_object_lct_packet_received_v internally (confirmed via coredump:
+					    //real use-after-free crash), leaving most_recent_atsc3_route_object_lct_packet_received
+					    //dangling. Use this local copy in the final log line instead of re-dereferencing it.
+					    long most_recent_received_timestamp_snapshot = atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received->most_recent_received_timestamp;
+					    long atsc3_route_object_given_up_duration = now - most_recent_received_timestamp_snapshot;
 
 						if( atsc3_route_object_given_up_duration > (_ATSC3_LLS_SLS_ALC_MONITOR_LCT_PACKETS_GIVEN_UP_SECONDS * 1000)) {
 							uint32_t computed_payload_received_size = 0;
@@ -509,13 +517,114 @@ void atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects
 
 							//jjustman: TODO: 2020-08-04 - flag objects with no length...
 							if(!atsc3_route_object->object_length || computed_payload_received_size < atsc3_route_object->object_length) {
-								should_free_and_unlink = true;
 
-								_ATSC3_LLS_TYPES_INFO("atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects: route_object: %p, given_up exceeded, should_free_and_unlink: true, given up duration: %ld, given up timestamp: %.4f (delta: %.4f), tsi: %d, toi: %d, object_length: %d, computed_payload_received_size: %d, lct_packets_received: %d, expected: %d",
+								//2026-09-20: before giving up entirely (genuinely no more packets are
+								//coming - this is _ATSC3_LLS_SLS_ALC_MONITOR_LCT_PACKETS_GIVEN_UP_SECONDS
+								//after the last one arrived), try a best-effort persist for objects that
+								//are "close enough" (>=90% of expected bytes received). Large objects
+								//(e.g. video, 600-700+ LCT packets) can lose a handful of packets to
+								//ordinary ambient loss with no FEC/repair-symbol recovery in this
+								//codebase, and previously that meant discarding an otherwise 97-98%
+								//complete object entirely. Only applied here at give-up time, never on
+								//the normal per-packet completion check, so this can't prematurely
+								//truncate an object that would have completed fully with more time.
+								bool best_effort_persisted = false;
+								if(atsc3_route_object->object_length &&
+								   computed_payload_received_size >= (uint32_t)(atsc3_route_object->object_length * 0.90) &&
+								   lls_sls_alc_monitor->atsc3_sls_metadata_fragments && lls_sls_alc_monitor->atsc3_sls_metadata_fragments->atsc3_route_s_tsid) {
+
+									atsc3_route_s_tsid_RS_t* matching_RS = NULL;
+									for(int rs_i = 0; rs_i < lls_sls_alc_monitor->atsc3_sls_metadata_fragments->atsc3_route_s_tsid->atsc3_route_s_tsid_RS_v.count && !matching_RS; rs_i++) {
+										atsc3_route_s_tsid_RS_t* candidate_RS = lls_sls_alc_monitor->atsc3_sls_metadata_fragments->atsc3_route_s_tsid->atsc3_route_s_tsid_RS_v.data[rs_i];
+										for(int rsls_i = 0; rsls_i < candidate_RS->atsc3_route_s_tsid_RS_LS_v.count; rsls_i++) {
+											if(candidate_RS->atsc3_route_s_tsid_RS_LS_v.data[rsls_i]->tsi == atsc3_route_object->tsi) {
+												matching_RS = candidate_RS;
+												break;
+											}
+										}
+									}
+
+									if(matching_RS) {
+										_ATSC3_LLS_TYPES_WARN("atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects: route_object: %p, tsi: %d, toi: %d, %.1f%% received (%d/%d bytes) - attempting best-effort persist instead of discarding",
+											atsc3_route_object, atsc3_route_object->tsi, atsc3_route_object->toi,
+											100.0 * computed_payload_received_size / atsc3_route_object->object_length,
+											computed_payload_received_size, atsc3_route_object->object_length);
+
+										udp_flow_t synthetic_udp_flow = {0};
+										synthetic_udp_flow.dst_ip_addr = matching_RS->dest_ip_addr;
+										synthetic_udp_flow.dst_port = matching_RS->dest_port;
+										synthetic_udp_flow.src_ip_addr = matching_RS->src_ip_addr;
+
+										atsc3_def_lct_hdr_t synthetic_lct_hdr = {0};
+										synthetic_lct_hdr.tsi = atsc3_route_object->tsi;
+										synthetic_lct_hdr.toi = atsc3_route_object->toi;
+										synthetic_lct_hdr.flag_b = 1; //close object flag
+
+										atsc3_alc_packet_t synthetic_alc_packet = {0};
+										synthetic_alc_packet.def_lct_hdr = &synthetic_lct_hdr;
+										synthetic_alc_packet.transfer_len = atsc3_route_object->object_length;
+
+										//2026-09-20: atsc3_route_object_set_object_recovery_complete()
+										//itself calls atsc3_route_object_free_atsc3_route_object_lct_packet_received()
+										//internally (since is_toi_init is still false here) - that destroys
+										//the entire accumulated packet vector, including every packet's
+										//pending_alc_payload_to_persist, BEFORE the persist call below ever
+										//gets to read it. Confirmed via hex dump: this produced correctly-sized
+										//but 100% all-zero output files, no error (nothing left to iterate).
+										//Set the completion timestamp directly instead - same effect on
+										//atsc3_route_object_is_complete()'s shortcut check, none of the
+										//destructive side effects of the public setter.
+										atsc3_route_object->recovery_complete_timestamp = gtl();
+
+										_ATSC3_LLS_TYPES_WARN("atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects: DIAGNOSTIC route_object: %p, atsc3_route_object_lct_packet_received_v.count RIGHT BEFORE persist call: %d, recovery_file_buffer: %p, temporary_object_recovery_filename: %s",
+											atsc3_route_object,
+											atsc3_route_object->atsc3_route_object_lct_packet_received_v.count,
+											atsc3_route_object->recovery_file_buffer,
+											atsc3_route_object->temporary_object_recovery_filename ? atsc3_route_object->temporary_object_recovery_filename : "(null)");
+
+										//2026-09-20: the persist function's own outer gate is
+										//"is_complete() && (is_toi_init || !recovery_complete_timestamp)" -
+										//setting recovery_complete_timestamp just above (needed to make
+										//is_complete() itself return true) makes "!recovery_complete_timestamp"
+										//false, and this is a regular fragment (not the bootstrap init
+										//object), so is_toi_init is also false - the whole gate silently
+										//failed and nothing was ever written (confirmed: zero output files
+										//despite "success" logging). Force is_toi_init temporarily so the
+										//gate's OR condition passes; restore it right after, defensively,
+										//though this object is freed/purged shortly regardless.
+										bool original_is_toi_init = atsc3_route_object->is_toi_init;
+										atsc3_route_object->is_toi_init = true;
+
+										atsc3_alc_packet_persist_to_toi_resource_process_sls_mbms_and_emit_callback(
+											&synthetic_udp_flow, &synthetic_alc_packet, lls_sls_alc_monitor, atsc3_route_object);
+
+										atsc3_route_object->is_toi_init = original_is_toi_init;
+
+										best_effort_persisted = true;
+									}
+								}
+
+								//2026-09-20: a real 100% completion (the "recovery_complete_timestamp"
+								//branch above this one) never frees the route_object immediately - the
+								//caller that persists it (route_process_from_alc_packet) leaves it in
+								//place, and it's only freed later, once already-completed, past the
+								//_ATSC3_LLS_SLS_ALC_MONITOR_LCT_PACKETS_RECOVERY_COMPLETE_PURGE_SECONDS
+								//window, by that other branch. Freeing it here immediately after a
+								//successful best-effort persist caused a real use-after-free/double-free
+								//crash (confirmed via coredump) - whatever bookkeeping the persist call
+								//does internally expects the object to still be alive afterward. So: only
+								//free/unlink here when we did NOT persist; a successful best-effort persist
+								//leaves the object alone and lets the existing, already-safe "completed,
+								//past purge duration" branch clean it up naturally next cycle.
+								should_free_and_unlink = !best_effort_persisted;
+
+								_ATSC3_LLS_TYPES_INFO("atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects: route_object: %p, given_up exceeded, should_free_and_unlink: %d, best_effort_persisted: %d, given up duration: %ld, given up timestamp: %.4f (delta: %.4f), tsi: %d, toi: %d, object_length: %d, computed_payload_received_size: %d, lct_packets_received: %d, expected: %d",
 										atsc3_route_object,
+										should_free_and_unlink,
+										best_effort_persisted,
                                         atsc3_route_object_given_up_duration,
-										atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received->most_recent_received_timestamp / 1000.0,
-										(now - atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received->most_recent_received_timestamp) / 1000.0,
+										most_recent_received_timestamp_snapshot / 1000.0,
+										(now - most_recent_received_timestamp_snapshot) / 1000.0,
 										atsc3_route_object->tsi,
 										atsc3_route_object->toi,
 										atsc3_route_object->object_length,

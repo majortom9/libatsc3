@@ -6,6 +6,7 @@
  */
 
 #include "atsc3_hevc_nal_extractor.h"
+#include <arpa/inet.h>
 
 int _ATSC3_HEVC_NAL_EXTRACTOR_INFO_ENABLED  = 0;
 int _ATSC3_HEVC_NAL_EXTRACTOR_DEBUG_ENABLED = 0;
@@ -14138,6 +14139,43 @@ typedef struct H264ParamSets {
 
 #endif
 
+static void remove_pps_h264(H264ParamSets *s, int id) {
+    if (s->pps_list[id] && s->pps == (const PPS *) s->pps_list[id]->data) {
+        s->pps = NULL;
+    }
+    av_buffer_unref(&s->pps_list[id]);
+}
+
+static void remove_sps_h264(H264ParamSets *s, int id) {
+    int i;
+    if (s->sps_list[id]) {
+        if (s->sps == (const SPS *) s->sps_list[id]->data) {
+            s->sps = NULL;
+        }
+
+/* drop all PPS that depend on this SPS */
+        for (i = 0; i < FF_ARRAY_ELEMS(s->pps_list); i++) {
+            if (s->pps_list[i] && ((PPS *) s->pps_list[i]->data)->sps_id == id) {
+                remove_pps_h264(s, i);
+            }
+        }
+
+        av_assert0(!(s->sps_list[id] && s->sps == (SPS *) s->sps_list[id]->data));
+    }
+    av_buffer_unref(&s->sps_list[id]);
+}
+
+static void ff_h264_ps_uninit(H264ParamSets *ps) {
+    int i;
+    for (i = 0; i < FF_ARRAY_ELEMS(ps->sps_list); i++) {
+        av_buffer_unref(&ps->sps_list[i]);
+    }
+    for (i = 0; i < FF_ARRAY_ELEMS(ps->pps_list); i++) {
+        av_buffer_unref(&ps->pps_list[i]);
+    }
+    av_buffer_unref(&ps->pps_ref);
+}
+
 /*
  * from buffer.c
  */
@@ -14789,7 +14827,7 @@ int ff_h264_decode_seq_parameter_set(GetBitContext *gb, AVCodecContext *avctx,
         !memcmp(ps->sps_list[sps_id]->data, sps_buf->data, sps_buf->size)) {
         av_buffer_unref(&sps_buf);
     } else {
-        remove_sps(ps, sps_id);
+        remove_sps_h264(ps, sps_id);
         ps->sps_list[sps_id] = sps_buf;
     }
 
@@ -15055,7 +15093,7 @@ int ff_h264_decode_picture_parameter_set(GetBitContext *gb, AVCodecContext *avct
                pps->transform_8x8_mode ? "8x8DCT" : "");
     }
 
-    remove_pps(ps, pps_id);
+    remove_pps_h264(ps, pps_id);
     ps->pps_list[pps_id] = pps_buf;
 
     return 0;
@@ -15388,7 +15426,7 @@ block_t* atsc3_h264_extract_extradata_nals_combined_ffmpegImpl(block_t* avcc_box
 //will return NULL on error
     error:
     done:
-    ff_hevc_ps_uninit(&ps);
+    ff_h264_ps_uninit(&ps);
 
     av_freep(&sps_data);
     av_freep(&pps_data);

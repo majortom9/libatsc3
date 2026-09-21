@@ -92,7 +92,27 @@ await_semaphore:
             __PLAYER_FFPLAY_INFO("after create player_pipe: %p", pipe_ffplay_buffer->player_pipe);
 
         }
-        
+
+		/*
+		 * 2026-09-20: player_pipe stays permanently NULL when
+		 * ATSC3_PLAYER_DISABLE is set (__pipe_create_deferred_ffplay
+		 * returns early without ever setting it) - previously nothing
+		 * downstream checked for that, so this thread would fwrite()
+		 * into a NULL FILE* every cycle. glibc doesn't fail that
+		 * gracefully: it segfaults inside fwrite's own internals, and
+		 * since that corrupts/crashes on a totally unrelated later
+		 * allocation (confirmed via a real crash inside pthread_create's
+		 * clone3() path), it looked like an unrelated heap-corruption
+		 * bug until traced back here. Discard this cycle's buffered
+		 * data and go back to waiting instead of ever calling fwrite()
+		 * on a null stream - this is the local-playback-disabled path
+		 * doing exactly what it's supposed to: nothing.
+		 */
+		if(!pipe_ffplay_buffer->player_pipe) {
+			pipe_ffplay_buffer->pipe_buffer_writer_pos = 0;
+			goto await_semaphore;
+		}
+
 		if(pipe_ffplay_buffer->pipe_buffer_writer_pos < __PLAYER_FFPLAY_BUFFER_WARNING_SIZE) {
 			__PLAYER_FFPLAY_WARN("WARNING - remaining buffer is less than %u, this may cause player underflow! ffplay BEFORE WRITE, to write to pipe: %p, from %p, pos: %d to %d",
 							__PLAYER_FFPLAY_BUFFER_WARNING_SIZE,
@@ -218,6 +238,31 @@ void sigpipe_register_action_handler(pipe_ffplay_buffer_t**  pipe_ffplay_buffer_
 
 void __pipe_create_deferred_ffplay(pipe_ffplay_buffer_t* pipe_ffplay_buffer) {
 
+	/*
+	 * ATSC3_PLAYER_DISABLE: skip local playback entirely (e.g. when only
+	 * the HTTP restream output is wanted - the local pipe is redundant
+	 * and generally lower quality than a client pulling from the MHD
+	 * server). Any non-empty value disables it. player_pipe stays NULL,
+	 * so this is checked (cheaply) every buffer cycle rather than once -
+	 * harmless, avoids touching every call site.
+	 */
+	if (getenv("ATSC3_PLAYER_DISABLE")) {
+		return;
+	}
+
+	/*
+	 * ATSC3_PLAYER_BIN: which player to launch, default "ffplay" for
+	 * back-compat. mpv (and anything else) doesn't understand ffplay's
+	 * CLI flags or its drawtext debug overlays (which also hardcode a
+	 * macOS-only font path, /System/Library/Fonts/Helvetica.ttc - this
+	 * was written on Mac originally), so anything other than "ffplay"
+	 * gets a plain "<bin> -" reading from stdin instead.
+	 */
+	const char* player_bin = getenv("ATSC3_PLAYER_BIN");
+	if (!player_bin || !*player_bin) {
+		player_bin = "ffplay";
+	}
+
 	//set a default value
 	float fps_for_timecode = 59.94;
 	char fps_for_playback_option[16] = "\0";
@@ -230,15 +275,20 @@ void __pipe_create_deferred_ffplay(pipe_ffplay_buffer_t* pipe_ffplay_buffer) {
 	//linux ffplay doesn't like -left 0 or -top 0
 	// scale=iw*.5:ih*.5:flags=bicubic
 	char cmd[2048];
+
+	if (strcmp(player_bin, "ffplay") != 0) {
+		snprintf((char*)cmd, 2048, "%s -", player_bin);
+	} else {
 //#define __SCALE_VIDEO__ 1
 #ifdef __SCALE_VIDEO__
 	snprintf((char*)cmd, 2048, "./ffplay -loglevel debug -infbuf -err_detect ignore_err -hide_banner -nostats -vf \"%sdrawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: timecode_rate=%.2f: timecode='00\\:00\\:00\\:00': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=550:y=h-th-50, drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: text='%%{pts}': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=500-tw:y=h-th-50, drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: text='%%{eif\\:n/25*90000\\:d}': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=500-tw:y=h-th-150, drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: text='%%{pict_type}': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=10-tw:y=th+10, scale=iw*.5:ih*.5:flags=bicubic\"  - > ffplay.errors 2>&1", fps_for_playback_option, fps_for_timecode);
 #else
 	snprintf((char*)cmd, 2048, "./ffplay -loglevel debug -infbuf -err_detect ignore_err -hide_banner -nostats -vf \"%sdrawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: timecode_rate=%.2f: timecode='00\\:00\\:00\\:00': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=550:y=h-th-50, drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: text='%%{pts}': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=500-tw:y=h-th-50, drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: text='%%{eif\\:n/25*90000\\:d}': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=500-tw:y=h-th-150, drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: fix_bounds=1: shadowx=2: shadowy=2: text='%%{pict_type}': fontcolor=white: fontsize=96: box=1: boxcolor=black@0.4: x=10-tw:y=th+10\"  - > ffplay.errors 2>&1", fps_for_playback_option, fps_for_timecode);
 #endif
+	}
 
 	__PLAYER_FFPLAY_INFO("creating player with args: %s", cmd);
-    
+
 	if ( !(pipe_ffplay_buffer->player_pipe = popen(cmd, "w")) ) {
 		__PLAYER_FFPLAY_ERROR("unable to create pipe for cmd: %s", cmd);
 		return;

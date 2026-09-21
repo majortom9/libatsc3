@@ -145,8 +145,8 @@ void atsc3_route_sls_process_from_alc_packet_and_file(udp_flow_t* udp_flow, atsc
 					atsc3_smime_validation_context->atsc3_cms_validation_context->transients.atsc3_certification_data = lls_sls_alc_monitor->transients.atsc3_certification_data;
 				}
 
-				//atsc3_smime_validation_context_set_cms_noverify(atsc3_smime_validation_context, true);
-				//atsc3_smime_validation_context_set_cms_no_content_verify(atsc3_smime_validation_context, true);
+				atsc3_smime_validation_context_set_cms_noverify(atsc3_smime_validation_context, true);
+				atsc3_smime_validation_context_set_cms_no_content_verify(atsc3_smime_validation_context, true);
 
 				atsc3_smime_validation_context_t* atsc3_smime_validation_context_ret = atsc3_smime_validate_from_context(atsc3_smime_validation_context);
 				
