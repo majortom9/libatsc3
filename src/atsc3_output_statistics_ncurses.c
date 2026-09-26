@@ -52,6 +52,9 @@ void ncurses_init() {
 	noecho();
 	
 	curs_set(0);
+	keypad(curscr, TRUE);
+	keypad(my_window, TRUE);
+	mousemask(BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
 	create_or_update_window_sizes(false);
 	//clearok(curscr, false);
 	//scrollok(curscr, false);
@@ -68,6 +71,111 @@ void mtl_clear() {
 	wmove(my_window, 0, 1);
 }
 
+//the SLT dump can be far taller than its window (every service is ~9 lines), so it
+//is rendered into lls_pad and lls_view_draw() shows the lls_scroll_offset slice
+#define LLS_PAD_LINES 1024
+int lls_scroll_offset = 0;
+
+//caller holds ncurses_writer_lock
+void lls_view_draw() {
+	int view_h, view_w, content_h, max_offset;
+
+	if(!lls_pad || !signaling_global_stats_window) {
+		return;
+	}
+	getmaxyx(signaling_global_stats_window, view_h, view_w);
+	if(view_h < 1 || view_w < 2) {
+		return;
+	}
+	content_h = getcury(lls_pad);
+
+	max_offset = content_h > view_h ? content_h - view_h : 0;
+	if(lls_scroll_offset > max_offset) {
+		lls_scroll_offset = max_offset;
+	}
+	if(lls_scroll_offset < 0) {
+		lls_scroll_offset = 0;
+	}
+
+	werase(signaling_global_stats_window);
+	copywin(lls_pad, signaling_global_stats_window, lls_scroll_offset, 0, 0, 0, view_h - 1, view_w - 2, FALSE);
+
+	//scroll bar in the last column, only when there is something to scroll
+	if(max_offset) {
+		int thumb_h = (view_h * view_h) / content_h;
+		if(thumb_h < 1) {
+			thumb_h = 1;
+		}
+		int thumb_y = ((view_h - thumb_h) * lls_scroll_offset) / max_offset;
+		for(int y = 0; y < view_h; y++) {
+			if(y >= thumb_y && y < thumb_y + thumb_h) {
+				mvwaddch(signaling_global_stats_window, y, view_w - 1, ' ' | A_REVERSE);
+			} else {
+				mvwaddch(signaling_global_stats_window, y, view_w - 1, ACS_VLINE);
+			}
+		}
+	}
+	wnoutrefresh(signaling_global_stats_window);
+}
+
+//returns true if ch was a scroll key for the SLT/service list
+bool lls_view_handle_key(int ch) {
+	int view_h = 1, view_w;
+	int delta;
+
+	if(signaling_global_stats_window) {
+		getmaxyx(signaling_global_stats_window, view_h, view_w);
+		(void)view_w;
+	}
+
+	switch(ch) {
+		case KEY_UP:
+		case 'k':
+			delta = -1;
+			break;
+		case KEY_DOWN:
+		case 'j':
+			delta = 1;
+			break;
+		case KEY_PPAGE:
+			delta = -(view_h - 1);
+			break;
+		case KEY_NPAGE:
+		case ' ':
+			delta = view_h - 1;
+			break;
+		case KEY_HOME:
+			delta = -LLS_PAD_LINES;
+			break;
+		case KEY_END:
+			delta = LLS_PAD_LINES;
+			break;
+		case KEY_MOUSE: {
+			MEVENT event;
+			if(getmouse(&event) != OK) {
+				return true;
+			}
+			if(event.bstate & BUTTON4_PRESSED) {
+				delta = -3;
+			} else if(event.bstate & BUTTON5_PRESSED) {
+				delta = 3;
+			} else {
+				return true;
+			}
+			break;
+		}
+		default:
+			return false;
+	}
+
+	ncurses_writer_lock_mutex_acquire();
+	lls_scroll_offset += delta;
+	lls_view_draw();
+	doupdate();
+	ncurses_writer_lock_mutex_release();
+	return true;
+}
+
 void* ncurses_input_run_thread(void* lls_slt_monitor_ptr) {
     int ch;
     ncurses_init();
@@ -79,6 +187,9 @@ void* ncurses_input_run_thread(void* lls_slt_monitor_ptr) {
     while(1) {
 
       ch = wgetch(curscr);
+		if(lls_view_handle_key(ch)) {
+			continue;
+		}
 		if(ch == CTRL('c') || ch == 'q') {
 			//end and clear screen back to terminal
 			goto endwin;
@@ -97,6 +208,9 @@ void* ncurses_input_run_thread(void* lls_slt_monitor_ptr) {
                 char mmt_input_str[16];
                 
                 ch = wgetch(my_window);
+                if(lls_view_handle_key(ch)) {
+                    continue;
+                }
                 //fallthru to play down below
                 if(ch == 'p') {
                     break;
@@ -194,6 +308,9 @@ void* ncurses_input_run_thread(void* lls_slt_monitor_ptr) {
 
 			while(1) {
 				ch = wgetch(my_window);
+				if(lls_view_handle_key(ch)) {
+					continue;
+				}
                 //fallthru to play down below
                 if(ch == 'p') {
                     break;
@@ -485,6 +602,8 @@ void create_or_update_window_sizes(bool should_reload_term_size) {
 			delwin(bw_window_lifetime);
 			delwin(bw_window_runtime);
 			delwin(bw_window_outline);
+			delwin(lls_pad);
+			lls_pad = NULL;
 			delwin(signaling_global_stats_window);
 			delwin(pkt_global_stats_window);
 			delwin(left_window_outline);
@@ -543,6 +662,9 @@ void create_or_update_window_sizes(bool should_reload_term_size) {
 	//left signaling
 	signaling_global_stats_window = derwin(left_window_outline, left_window_h-11, left_window_w-50, 1, 46 );
 	scrollok(signaling_global_stats_window, false);
+	//last column of signaling_global_stats_window is the scroll bar
+	lls_pad = newpad(LLS_PAD_LINES, left_window_w-51 > 1 ? left_window_w-51 : 1);
+	scrollok(lls_pad, false);
 	//left
 	//bandwidth window
 	bw_window_outline = 		derwin(left_window_outline, 	8, 			left_window_w-2,  left_window_h-8, 	1);
@@ -611,8 +733,8 @@ void* print_lls_instance_table_thread(void* lls_slt_monitor_ptr) {
 			//clear our window so we aren't appending, otherwise it will look as if we are leaking slt
 			__LLS_DUMP_CLEAR();
 			lls_dump_instance_table_ncurses(lls_slt_monitor->lls_latest_slt_table);
-			__DOUPDATE();
 			__LLS_REFRESH();
+			__DOUPDATE();
 	       
 			ncurses_writer_lock_mutex_release();
 		}

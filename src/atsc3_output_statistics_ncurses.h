@@ -52,6 +52,8 @@ void handle_sighup(int sig);
 
 void* print_lls_instance_table_thread(void*);
 void lls_dump_instance_table_ncurses(atsc3_lls_table_t* lls_session);
+void lls_view_draw(void);
+bool lls_view_handle_key(int ch);
 
 #else
 #define ncurses_init(...)
@@ -87,6 +89,7 @@ extern WINDOW* my_window;
 extern WINDOW* left_window_outline;
 extern	WINDOW* pkt_global_stats_window;
 extern	WINDOW* signaling_global_stats_window;
+extern	WINDOW* lls_pad;
 
 extern	WINDOW* bw_window_outline;
 extern		WINDOW* bw_window_runtime;
@@ -160,14 +163,16 @@ extern WINDOW* pkt_flow_stats_mmt_log_window;
 
 
 
-#define __LLS_DUMP_NOUPDATE() 		wnoutrefresh(signaling_global_stats_window);
+//the SLT dump is rendered into lls_pad, then lls_view_draw() copies the scrolled
+//region into signaling_global_stats_window and draws the scroll bar
+#define __LLS_DUMP_NOUPDATE() 		lls_view_draw();
 
-#define __LLS_DUMP_CLEAR() 			werase(signaling_global_stats_window);
+#define __LLS_DUMP_CLEAR() 			werase(lls_pad);
 
-#define __LLS_DUMP(...)				wprintw(signaling_global_stats_window, __VA_ARGS__); \
-									wprintw(signaling_global_stats_window,"\n");
+#define __LLS_DUMP(...)				wprintw(lls_pad, __VA_ARGS__); \
+									wprintw(lls_pad,"\n");
 
-#define __LLS_REFRESH() 			wnoutrefresh(signaling_global_stats_window);
+#define __LLS_REFRESH() 			lls_view_draw();
 
 
 

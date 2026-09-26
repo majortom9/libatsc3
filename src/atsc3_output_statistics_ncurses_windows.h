@@ -16,6 +16,7 @@ WINDOW* my_window;
 WINDOW* left_window_outline;
 	WINDOW* pkt_global_stats_window;
 	WINDOW* signaling_global_stats_window;
+	WINDOW* lls_pad;
 
 	WINDOW* bw_window_outline;
 		WINDOW* bw_window_runtime;
