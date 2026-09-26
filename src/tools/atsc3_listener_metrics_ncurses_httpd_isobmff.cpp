@@ -108,9 +108,16 @@ extern atsc3_global_statistics_t* atsc3_global_statistics;
 #include <utility>
 
 #define PORT 8889
+#define PORT_AUDIO 8890
 
 #define FILENAME "test.mp4"
 #define MIMETYPE "video/mp4"
+#define MIMETYPE_AUDIO "audio/mp4"
+
+//The video track's HTTP buffer lives on the ALC monitor (created by
+//global_autoplay_run_thread); the audio track, served on PORT_AUDIO, gets its
+//own. HTTP callbacks receive the buffer as cls - NULL means the monitor's.
+static http_output_buffer_t audio_http_output_buffer;
 
 #define PAGE "<html><head><title>File not found</title></head><body>File not found</body></html>"
 
@@ -147,23 +154,27 @@ static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls,
 	while(true) {
 		__INFO("http_output_response_from_player_pipe_reader_callback: enter: pos: %"PRIu64", buf: %p, max_size: %lu", pos, buf, max);
 
-		lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
+		http_output_buffer_t* http_output_buffer = (http_output_buffer_t*)cls;
+		if(!http_output_buffer) {
+			lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
 
-		if(!output_buffer_mode) {
+			if(!output_buffer_mode) {
 				__WARN("http_output_response_from_player_pipe_reader_callback: no active ALC or MMT monitor yet");
 				//sleep so we don't spinlock too fast
 				usleep(100000);
 				continue;
 			}
-		if(!output_buffer_mode->http_output_buffer) {
+			http_output_buffer = output_buffer_mode->http_output_buffer;
+		}
+		if(!http_output_buffer) {
 			__WARN("http_output_response_from_player_pipe_reader_callback: not http_output_buffer yet");
 			//sleep so we don't spinlock too fast
 			usleep(100000);
 			continue;
 		}
-		output_buffer_mode->http_output_buffer->http_output_conntected = true;
-		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output &&
-				!output_buffer_mode->http_output_buffer->http_payload_buffer_incoming) {
+		http_output_buffer->http_output_conntected = true;
+		if(!http_output_buffer->http_payload_buffer_client_output &&
+				!http_output_buffer->http_payload_buffer_incoming) {
 			__WARN("http_output_response_from_player_pipe_reader_callback: both buffers are null, retrying");
 			//sleep so we don't spinlock too fast
 			usleep(100000);
@@ -176,20 +187,20 @@ static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls,
 		//gain by waiting here, and with a threshold > 1 it deadlocks: the writer won't
 		//push item 2 until item 1 is read, but the reader won't read item 1 until 4
 		//items have been written.
-		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output &&
-				output_buffer_mode->http_output_buffer->total_fragments_incoming_written < 1) {
+		if(!http_output_buffer->http_payload_buffer_client_output &&
+				http_output_buffer->total_fragments_incoming_written < 1) {
 				__WARN("http_output_response_from_player_pipe_reader_callback: no fragments written yet, retrying");
 				//sleep so we don't spinlock too fast
 				usleep(100000);
 				continue;
 			}
 
-		lls_sls_monitor_reader_mutex_lock(output_buffer_mode->http_output_buffer->http_payload_buffer_mutex);
+		lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
 		//swap
-		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output && output_buffer_mode->http_output_buffer->http_payload_buffer_incoming) {
-			output_buffer_mode->http_output_buffer->http_payload_buffer_client_output = output_buffer_mode->http_output_buffer->http_payload_buffer_incoming;
-			output_buffer_mode->http_output_buffer->http_payload_buffer_incoming = NULL;
-			output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos = 0;
+		if(!http_output_buffer->http_payload_buffer_client_output && http_output_buffer->http_payload_buffer_incoming) {
+			http_output_buffer->http_payload_buffer_client_output = http_output_buffer->http_payload_buffer_incoming;
+			http_output_buffer->http_payload_buffer_incoming = NULL;
+			http_output_buffer->http_payload_buffer_client_output->i_pos = 0;
 		}
 
 		//2026-09-20: the checks above this mutex are unprotected reads, so a second
@@ -199,37 +210,37 @@ static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls,
 		//reaches here (the other connection's thread having just consumed and freed
 		//the only available block). This buffer is fundamentally single-client -
 		//retry instead of dereferencing NULL.
-		if(!output_buffer_mode->http_output_buffer->http_payload_buffer_client_output) {
-			lls_sls_monitor_reader_mutex_unlock(output_buffer_mode->http_output_buffer->http_payload_buffer_mutex);
+		if(!http_output_buffer->http_payload_buffer_client_output) {
+			lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
 			usleep(100000);
 			continue;
 		}
 
 		//block copy accordingly
-		uint32_t block_pos = output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos;
-		uint32_t block_size = __MIN(max, output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_size - output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos);
+		uint32_t block_pos = http_output_buffer->http_payload_buffer_client_output->i_pos;
+		uint32_t block_size = __MIN(max, http_output_buffer->http_payload_buffer_client_output->p_size - http_output_buffer->http_payload_buffer_client_output->i_pos);
 
 		__INFO("http_output_response_from_player_pipe_reader_callback: copying from %p, block_pos (i_pos): %u, block_size: %u, p_size: %u",
-				output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_buffer,
+				http_output_buffer->http_payload_buffer_client_output->p_buffer,
 				block_pos,
 				block_size,
-				output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_size);
+				http_output_buffer->http_payload_buffer_client_output->p_size);
 
 
 
-		memcpy(buf, &output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_buffer
+		memcpy(buf, &http_output_buffer->http_payload_buffer_client_output->p_buffer
 				[block_pos], block_size);
-		output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos += block_size;
+		http_output_buffer->http_payload_buffer_client_output->i_pos += block_size;
 
-		if(output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->i_pos == output_buffer_mode->http_output_buffer->http_payload_buffer_client_output->p_size) {
+		if(http_output_buffer->http_payload_buffer_client_output->i_pos == http_output_buffer->http_payload_buffer_client_output->p_size) {
 			__INFO("http_output_response_from_player_pipe_reader_callback: end of output buffer, setting null");
-			block_Release(&output_buffer_mode->http_output_buffer->http_payload_buffer_client_output);
+			block_Release(&http_output_buffer->http_payload_buffer_client_output);
 
 		}
 
-		lls_sls_monitor_reader_mutex_unlock(output_buffer_mode->http_output_buffer->http_payload_buffer_mutex);
+		lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
 
-		__INFO("http_output_response_from_player_pipe_reader_callback: return: returning size: %u, total incoming fragments written: %u", block_size, output_buffer_mode->http_output_buffer->total_fragments_incoming_written);
+		__INFO("http_output_response_from_player_pipe_reader_callback: return: returning size: %u, total incoming fragments written: %u", block_size, http_output_buffer->total_fragments_incoming_written);
 
 		return block_size;
 	}
@@ -238,9 +249,15 @@ static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls,
 
 static void http_output_response_from_player_pipe_reader_free_callback (void *cls)
 {
-	lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
-	if(output_buffer_mode && output_buffer_mode->http_output_buffer) {
-		output_buffer_mode->http_output_buffer->http_output_conntected = false;
+	http_output_buffer_t* http_output_buffer = (http_output_buffer_t*)cls;
+	if(!http_output_buffer) {
+		lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
+		if(output_buffer_mode) {
+			http_output_buffer = output_buffer_mode->http_output_buffer;
+		}
+	}
+	if(http_output_buffer) {
+		http_output_buffer->http_output_conntected = false;
 	}
 	__INFO("http_output_response_from_player_pipe_reader_free_callback: closing: %p", cls);
 }
@@ -262,7 +279,6 @@ static enum MHD_Result http_output_response_from_player_pipe (void *cls,
 	//  DIR *dir;
 	struct stat buf;
 	char emsg[1024];
-	(void)cls;               /* Unused. Silent compiler warning. */
 	(void)version;           /* Unused. Silent compiler warning. */
 	(void)upload_data;       /* Unused. Silent compiler warning. */
 	(void)upload_data_size;  /* Unused. Silent compiler warning. */
@@ -270,15 +286,16 @@ static enum MHD_Result http_output_response_from_player_pipe (void *cls,
 	if (0 != strcmp (method, MHD_HTTP_METHOD_GET))
 	return MHD_NO;              /* unexpected method */
 
+	//cls is this daemon's http_output_buffer_t (NULL for the video/monitor one)
   	response = MHD_create_response_from_callback (MHD_SIZE_UNKNOWN, 512 * 1024,     /* 512k page size */
                                                     &http_output_response_from_player_pipe_reader_callback,
-                                                    NULL,
+                                                    cls,
                                                     &http_output_response_from_player_pipe_reader_free_callback);
 
 	if (NULL == response){
 		return MHD_NO;
 	}
-	MHD_add_response_header(response, "Content-Type", MIMETYPE);
+	MHD_add_response_header(response, "Content-Type", cls ? MIMETYPE_AUDIO : MIMETYPE);
 
 	ret = MHD_queue_response (connection, MHD_HTTP_OK, response);
 	//not sure if this is needed here or not..
@@ -295,10 +312,21 @@ static enum MHD_Result http_output_response_from_player_pipe (void *cls,
 //pipe and the HTTP output buffer. Mirrors the locking pattern already used
 //elsewhere for each buffer (pipe_buffer_reader_mutex_lock/unlock + semaphore
 //post for ffplay; lls_sls_monitor_reader_mutex_lock/unlock for http).
-//init segment kept by route_file_watcher_run_thread, so an HTTP client that
-//connects after it was pushed can still be given it before any fragment
-static block_t* route_file_watcher_init_block = NULL;
-static bool route_file_watcher_http_primed = false;
+//One route_file_watcher_run_thread per track: video feeds the local ffplay
+//pipe and the monitor's HTTP buffer (PORT); audio has its own HTTP buffer
+//(PORT_AUDIO) - one ffplay pipe can only carry one track.
+typedef struct route_file_watcher_track {
+    const char*           label;              //"video" or "audio", for logs and the ready flag
+    std::string           prefix;             //afdt:fileTemplate prefix, e.g. "video-", "a0-a02_2-"
+    bool                  feed_ffplay;
+    http_output_buffer_t* http_output_buffer; //NULL: the ALC monitor's (video) buffer
+    //init segment kept so an HTTP client that connects later is given it first
+    block_t*              init_block;
+    bool                  http_primed;
+} route_file_watcher_track_t;
+
+static route_file_watcher_track_t route_file_watcher_video_track = { "video", "", true, NULL, NULL, false };
+static route_file_watcher_track_t route_file_watcher_audio_track = { "audio", "", false, &audio_http_output_buffer, NULL, false };
 
 //hand a block to the connected client's one-slot mailbox once the previous
 //one is consumed; false if no client is (or stays) connected
@@ -322,13 +350,13 @@ static bool route_file_watcher_http_slot_push(http_output_buffer_t* http_output_
     }
 }
 
-static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
+static void route_file_watcher_push_block_to_outputs(route_file_watcher_track_t* track, block_t* content_block) {
     if(!lls_slt_monitor->lls_sls_alc_monitor || !content_block) {
         return;
     }
     lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = &lls_slt_monitor->lls_sls_alc_monitor->lls_sls_monitor_output_buffer_mode;
 
-    if(output_buffer_mode->ffplay_output_enabled && output_buffer_mode->pipe_ffplay_buffer) {
+    if(track->feed_ffplay && output_buffer_mode->ffplay_output_enabled && output_buffer_mode->pipe_ffplay_buffer) {
         pipe_ffplay_buffer_t* pipe_ffplay_buffer = output_buffer_mode->pipe_ffplay_buffer;
         pipe_buffer_reader_mutex_lock(pipe_ffplay_buffer);
         pipe_buffer_unsafe_push_block(pipe_ffplay_buffer, content_block->p_buffer, content_block->p_size);
@@ -337,8 +365,11 @@ static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
         pipe_buffer_reader_mutex_unlock(pipe_ffplay_buffer);
     }
 
-    if(output_buffer_mode->http_output_enabled && output_buffer_mode->http_output_buffer) {
-        http_output_buffer_t* http_output_buffer = output_buffer_mode->http_output_buffer;
+    http_output_buffer_t* http_output_buffer = track->http_output_buffer;
+    if(!http_output_buffer && output_buffer_mode->http_output_enabled) {
+        http_output_buffer = output_buffer_mode->http_output_buffer;
+    }
+    if(http_output_buffer) {
 
         //2026-09-20: http_payload_buffer_incoming is a single-slot mailbox, not a queue:
         //pushing before the reader consumed the previous block would drop it, so each
@@ -347,14 +378,14 @@ static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
         //feed) stalled for good right after the init segment. So skip HTTP while no
         //client is connected, and give a client the init segment before any fragment.
         if(!http_output_buffer->http_output_conntected) {
-            route_file_watcher_http_primed = false;
+            track->http_primed = false;
         } else {
-            if(!route_file_watcher_http_primed && route_file_watcher_init_block) {
-                route_file_watcher_http_primed = route_file_watcher_http_slot_push(http_output_buffer, route_file_watcher_init_block);
+            if(!track->http_primed && track->init_block) {
+                track->http_primed = route_file_watcher_http_slot_push(http_output_buffer, track->init_block);
             }
-            if(route_file_watcher_http_primed && content_block != route_file_watcher_init_block) {
+            if(track->http_primed && content_block != track->init_block) {
                 if(!route_file_watcher_http_slot_push(http_output_buffer, content_block)) {
-                    route_file_watcher_http_primed = false;
+                    track->http_primed = false;
                 }
             }
         }
@@ -372,9 +403,12 @@ static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
 //convention per flow. This thread bypasses the broken bridge entirely: watch
 //that directory for a chosen track's init segment + newly-arriving fragments
 //and push their real bytes directly into the ffplay pipe / http buffer.
-//Prefix/service_id are configurable via ATSC3_AUTOPLAY_TRACK_PREFIX (default
-//"a0-a02_2-", the first audio track) and ATSC3_AUTOPLAY_SERVICE_ID.
+//One thread per track (see route_file_watcher_track_t); prefixes come from
+//ATSC3_AUTOPLAY_TRACK_PREFIX / ATSC3_AUTOPLAY_AUDIO_TRACK_PREFIX, service from
+//ATSC3_AUTOPLAY_SERVICE_ID.
 void* route_file_watcher_run_thread(void* p) {
+    route_file_watcher_track_t* track = (route_file_watcher_track_t*)p;
+
     while(!lls_slt_monitor->lls_sls_alc_monitor || !lls_slt_monitor->lls_sls_alc_monitor->atsc3_lls_slt_service) {
         sleep(1);
     }
@@ -382,8 +416,7 @@ void* route_file_watcher_run_thread(void* p) {
     sleep(5);
 
     uint16_t service_id = lls_slt_monitor->lls_sls_alc_monitor->atsc3_lls_slt_service->service_id;
-    const char* prefix_env = getenv("ATSC3_AUTOPLAY_TRACK_PREFIX");
-    std::string prefix = prefix_env ? prefix_env : "a0-a02_2-";
+    const std::string& prefix = track->prefix;
 
     char dir_path[256];
     snprintf(dir_path, sizeof(dir_path), "route/%u", service_id);
@@ -419,13 +452,13 @@ void* route_file_watcher_run_thread(void* p) {
     if(init_block) {
         __INFO("route_file_watcher_run_thread: pushing init segment: %s, size: %d", init_path.c_str(), init_block->p_size);
         //kept (not destroyed) so a later HTTP client can be primed with it
-        route_file_watcher_init_block = init_block;
-        route_file_watcher_push_block_to_outputs(init_block);
-        if(prefix.compare(0, 5, "video") == 0) {
+        track->init_block = init_block;
+        route_file_watcher_push_block_to_outputs(track, init_block);
+        if(track == &route_file_watcher_video_track) {
             atsc3_global_statistics->video_endpoint_port = PORT;
             atsc3_global_statistics->video_endpoint_ready = true;
         } else {
-            atsc3_global_statistics->audio_endpoint_port = PORT;
+            atsc3_global_statistics->audio_endpoint_port = PORT_AUDIO;
             atsc3_global_statistics->audio_endpoint_ready = true;
         }
     } else {
@@ -519,7 +552,7 @@ void* route_file_watcher_run_thread(void* p) {
                 block_t* frag_block = block_Read_from_filename(frag_path);
                 if(frag_block) {
                     __INFO("route_file_watcher_run_thread: pushing fragment: %s, size: %d", frag_path, frag_block->p_size);
-                    route_file_watcher_push_block_to_outputs(frag_block);
+                    route_file_watcher_push_block_to_outputs(track, frag_block);
                     block_Destroy(&frag_block);
                     last_toi_pushed = tois[i].first;
                 } else {
@@ -686,12 +719,25 @@ void* global_httpd_run_thread(void* lls_slt_monitor_ptr) {
 
     struct MHD_Daemon *daemon;
 
+    //the handler's cls is the daemon's http_output_buffer_t: NULL for video
+    //(the ALC monitor's buffer), the audio track's own buffer on PORT_AUDIO
     daemon = MHD_start_daemon (MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG,
                            PORT,
-                           NULL, NULL, &http_output_response_from_player_pipe, (void*)PAGE, MHD_OPTION_END);
+                           NULL, NULL, &http_output_response_from_player_pipe, NULL, MHD_OPTION_END);
 
     if (NULL == daemon) return NULL;
     MHD_run(daemon);
+
+    if(!route_file_watcher_audio_track.prefix.empty()) {
+        struct MHD_Daemon *audio_daemon = MHD_start_daemon (MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG,
+                               PORT_AUDIO,
+                               NULL, NULL, &http_output_response_from_player_pipe, (void*)&audio_http_output_buffer, MHD_OPTION_END);
+        if(audio_daemon) {
+            MHD_run(audio_daemon);
+        } else {
+            __ERROR("global_httpd_run_thread: unable to start audio HTTP daemon on port %d", PORT_AUDIO);
+        }
+    }
 
     while(true) {
     	sleep(1);
@@ -1215,6 +1261,18 @@ int main(int argc,char **argv) {
 	pthread_t global_slt_thread_id;
 	pthread_create(&global_slt_thread_id, NULL, print_lls_instance_table_thread, (void*)lls_slt_monitor);
 
+	//route file watcher tracks - set before the HTTP thread, which only starts
+	//the audio daemon when an audio track is configured. An empty
+	//ATSC3_AUTOPLAY_AUDIO_TRACK_PREFIX disables audio.
+	const char* video_prefix_env = getenv("ATSC3_AUTOPLAY_TRACK_PREFIX");
+	route_file_watcher_video_track.prefix = video_prefix_env ? video_prefix_env : "video-";
+	const char* audio_prefix_env = getenv("ATSC3_AUTOPLAY_AUDIO_TRACK_PREFIX");
+	route_file_watcher_audio_track.prefix = audio_prefix_env ? audio_prefix_env : "a0-a02_2-";
+	if(route_file_watcher_audio_track.prefix == route_file_watcher_video_track.prefix) {
+		route_file_watcher_audio_track.prefix.clear();
+	}
+	audio_http_output_buffer.http_payload_buffer_mutex = lls_sls_monitor_reader_mutext_create();
+
 	pthread_t global_http_thread_id;
 	pthread_create(&global_http_thread_id, NULL, global_httpd_run_thread, (void*)lls_slt_monitor);
 
@@ -1229,7 +1287,12 @@ int main(int argc,char **argv) {
 	pthread_create(&global_autoplay_thread_id, NULL, global_autoplay_run_thread, NULL);
 
 	pthread_t global_route_file_watcher_thread_id;
-	pthread_create(&global_route_file_watcher_thread_id, NULL, route_file_watcher_run_thread, NULL);
+	pthread_create(&global_route_file_watcher_thread_id, NULL, route_file_watcher_run_thread, &route_file_watcher_video_track);
+
+	if(!route_file_watcher_audio_track.prefix.empty()) {
+		pthread_t global_route_file_watcher_audio_thread_id;
+		pthread_create(&global_route_file_watcher_audio_thread_id, NULL, route_file_watcher_run_thread, &route_file_watcher_audio_track);
+	}
 
 	pthread_join(global_pcap_thread_id, NULL);
 	pthread_join(global_ncurses_input_thread_id, NULL);
