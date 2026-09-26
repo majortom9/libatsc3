@@ -295,6 +295,33 @@ static enum MHD_Result http_output_response_from_player_pipe (void *cls,
 //pipe and the HTTP output buffer. Mirrors the locking pattern already used
 //elsewhere for each buffer (pipe_buffer_reader_mutex_lock/unlock + semaphore
 //post for ffplay; lls_sls_monitor_reader_mutex_lock/unlock for http).
+//init segment kept by route_file_watcher_run_thread, so an HTTP client that
+//connects after it was pushed can still be given it before any fragment
+static block_t* route_file_watcher_init_block = NULL;
+static bool route_file_watcher_http_primed = false;
+
+//hand a block to the connected client's one-slot mailbox once the previous
+//one is consumed; false if no client is (or stays) connected
+static bool route_file_watcher_http_slot_push(http_output_buffer_t* http_output_buffer, block_t* content_block) {
+    while(true) {
+        lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
+        bool connected = http_output_buffer->http_output_conntected;
+        bool slot_free = connected && !http_output_buffer->http_payload_buffer_incoming;
+        if(slot_free) {
+            http_output_buffer->http_payload_buffer_incoming = block_Duplicate(content_block);
+            http_output_buffer->total_fragments_incoming_written++;
+        }
+        lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
+        if(slot_free) {
+            return true;
+        }
+        if(!connected) {
+            return false;
+        }
+        usleep(50000);
+    }
+}
+
 static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
     if(!lls_slt_monitor->lls_sls_alc_monitor || !content_block) {
         return;
@@ -313,25 +340,23 @@ static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
     if(output_buffer_mode->http_output_enabled && output_buffer_mode->http_output_buffer) {
         http_output_buffer_t* http_output_buffer = output_buffer_mode->http_output_buffer;
 
-        //2026-09-20: http_payload_buffer_incoming is a single-slot mailbox, not a queue.
-        //Pushing a new fragment before the reader callback has consumed the previous one
-        //(swapped it into http_payload_buffer_client_output) silently block_Destroy()s
-        //and drops it - including, fatally, the init segment itself, since a burst of
-        //already-completed fragments on disk gets pushed with no delay between them.
-        //Block here until the previous one is actually picked up, so delivery to
-        //whichever client is connected is complete and in order.
-        while(true) {
-            lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
-            bool slot_free = !http_output_buffer->http_payload_buffer_incoming;
-            if(slot_free) {
-                http_output_buffer->http_payload_buffer_incoming = block_Duplicate(content_block);
-                http_output_buffer->total_fragments_incoming_written++;
+        //2026-09-20: http_payload_buffer_incoming is a single-slot mailbox, not a queue:
+        //pushing before the reader consumed the previous block would drop it, so each
+        //push waits for the slot. But only a connected client ever drains it - with none
+        //connected that wait never ended, and this thread (and with it the local player
+        //feed) stalled for good right after the init segment. So skip HTTP while no
+        //client is connected, and give a client the init segment before any fragment.
+        if(!http_output_buffer->http_output_conntected) {
+            route_file_watcher_http_primed = false;
+        } else {
+            if(!route_file_watcher_http_primed && route_file_watcher_init_block) {
+                route_file_watcher_http_primed = route_file_watcher_http_slot_push(http_output_buffer, route_file_watcher_init_block);
             }
-            lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
-            if(slot_free) {
-                break;
+            if(route_file_watcher_http_primed && content_block != route_file_watcher_init_block) {
+                if(!route_file_watcher_http_slot_push(http_output_buffer, content_block)) {
+                    route_file_watcher_http_primed = false;
+                }
             }
-            usleep(50000);
         }
     }
 }
@@ -347,9 +372,6 @@ static void route_file_watcher_push_block_to_outputs(block_t* content_block) {
 //convention per flow. This thread bypasses the broken bridge entirely: watch
 //that directory for a chosen track's init segment + newly-arriving fragments
 //and push their real bytes directly into the ffplay pipe / http buffer.
-//Video (TSI 100 on this mux) doesn't work this way yet - real objects are ~2-3%
-//short of complete before giving up (no working FEC/repair-symbol recovery for
-//this large an object), so this currently only carries audio successfully.
 //Prefix/service_id are configurable via ATSC3_AUTOPLAY_TRACK_PREFIX (default
 //"a0-a02_2-", the first audio track) and ATSC3_AUTOPLAY_SERVICE_ID.
 void* route_file_watcher_run_thread(void* p) {
@@ -378,13 +400,12 @@ void* route_file_watcher_run_thread(void* p) {
      * the ACTUAL working writer is
      * atsc3_alc_packet_persist_to_toi_resource_process_sls_mbms_and_emit_callback,
      * which does write real route/<service_id>/<prefix><TOI>.<ext> files
-     * matching exactly what this original logic already watches for. The
-     * reason ATSC3_AUTOPLAY_TRACK_PREFIX=video- never produces anything is
-     * upstream of this watcher: video objects on this mux arrive ~2-3%
-     * short of complete and so never reach "complete" for any writer to
-     * persist. The shortfall is NOT settled as broadcast loss - the vendor
-     * app plays this mux cleanly, and atsc3-player.py's missing objects
-     * turned out to be its own reassembly bug - so still investigate.
+     * matching exactly what this original logic already watches for.
+     *
+     * 2026-09-26: nothing was written for a long time because this station
+     * signs its SLS and the no-verify path still demanded LLS
+     * CertificationData, so every SLS (and with it every media object) was
+     * dropped - fixed in atsc3_smime_validate_from_context().
      */
     __INFO("route_file_watcher_run_thread: watching dir: %s, prefix: %s, waiting for init segment: %s",
            dir_path, prefix.c_str(), init_path.c_str());
@@ -397,8 +418,16 @@ void* route_file_watcher_run_thread(void* p) {
     block_t* init_block = block_Read_from_filename(init_path.c_str());
     if(init_block) {
         __INFO("route_file_watcher_run_thread: pushing init segment: %s, size: %d", init_path.c_str(), init_block->p_size);
+        //kept (not destroyed) so a later HTTP client can be primed with it
+        route_file_watcher_init_block = init_block;
         route_file_watcher_push_block_to_outputs(init_block);
-        block_Destroy(&init_block);
+        if(prefix.compare(0, 5, "video") == 0) {
+            atsc3_global_statistics->video_endpoint_port = PORT;
+            atsc3_global_statistics->video_endpoint_ready = true;
+        } else {
+            atsc3_global_statistics->audio_endpoint_port = PORT;
+            atsc3_global_statistics->audio_endpoint_ready = true;
+        }
     } else {
         __ERROR("route_file_watcher_run_thread: unable to read init segment: %s", init_path.c_str());
     }

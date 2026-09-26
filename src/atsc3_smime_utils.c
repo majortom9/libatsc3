@@ -176,6 +176,69 @@ atsc3_smime_validation_context_t* atsc3_smime_validation_context_certificate_pay
  
  */
 
+/*
+ * Return the signed MIME entity of a multipart/signed S/MIME payload without
+ * verifying the signature. The signature only authenticates the SLS; the
+ * entity it covers (the multipart/related USBD/S-TSID/MPD) is plain text.
+ * SMIME_read_CMS() hands that first body part back as a separate BIO for
+ * detached signatures, which is exactly what CMS_verify() would copy out.
+ */
+static block_t* atsc3_smime_extract_unverified_payload(block_t* raw_smime_payload) {
+	BIO* smime_in = NULL;
+	BIO* signed_content = NULL;
+	BIO* content_out = NULL;
+	CMS_ContentInfo* cms = NULL;
+	block_t* extracted = NULL;
+	char copy_buf[4096];
+	char* content_out_p = NULL;
+	long content_out_len = 0;
+	int n;
+
+	block_Rewind(raw_smime_payload);
+	smime_in = BIO_new_mem_buf(block_Get(raw_smime_payload), block_Remaining_size(raw_smime_payload));
+	if(!smime_in) {
+		goto cleanup;
+	}
+
+	cms = SMIME_read_CMS(smime_in, &signed_content);
+	if(!cms || !signed_content) {
+		_ATSC3_SMIME_UTILS_WARN("atsc3_smime_extract_unverified_payload: not a detached multipart/signed payload (cms: %p, content: %p)", cms, signed_content);
+		goto cleanup;
+	}
+
+	content_out = BIO_new(BIO_s_mem());
+	if(!content_out) {
+		goto cleanup;
+	}
+	while((n = BIO_read(signed_content, copy_buf, sizeof(copy_buf))) > 0) {
+		BIO_write(content_out, copy_buf, n);
+	}
+
+	content_out_len = BIO_get_mem_data(content_out, &content_out_p);
+	if(content_out_len > 0) {
+		extracted = block_Alloc(content_out_len);
+		block_Write(extracted, (uint8_t*) content_out_p, content_out_len);
+		block_Rewind(extracted);
+	}
+
+cleanup:
+	if(content_out) {
+		BIO_free(content_out);
+	}
+	if(signed_content) {
+		BIO_free(signed_content);
+	}
+	if(cms) {
+		CMS_ContentInfo_free(cms);
+	}
+	if(smime_in) {
+		BIO_free(smime_in);
+	}
+	block_Rewind(raw_smime_payload);
+
+	return extracted;
+}
+
 atsc3_smime_validation_context_t* atsc3_smime_validate_from_context(atsc3_smime_validation_context_t* atsc3_smime_validation_context) {
 
 	//resync our raw binary payload
@@ -190,8 +253,25 @@ atsc3_smime_validation_context_t* atsc3_smime_validate_from_context(atsc3_smime_
 	if(atsc3_cms_validate_from_context(atsc3_smime_validation_context->atsc3_cms_validation_context)) {
 		atsc3_smime_validation_context->atsc3_smime_entity->cms_verified_extracted_mime_entity = block_Duplicate(atsc3_smime_validation_context->atsc3_smime_entity->atsc3_cms_entity->cms_verified_extracted_payload);
 		return atsc3_smime_validation_context;
-	} else {
-		return NULL;
 	}
+
+	/*
+	 * The no-verify flags are meant to disable validation, but
+	 * atsc3_cms_validate_from_context() still needs the LLS CertificationData
+	 * to build its certificate chain and returns NULL without it - so a
+	 * receiver that never gets that table dropped every signed SLS, and with
+	 * it all media. When the caller asked for no verification, honour that.
+	 */
+	if(atsc3_smime_validation_context->atsc3_cms_validation_context->cms_no_content_verify ||
+	   atsc3_smime_validation_context->atsc3_cms_validation_context->cms_noverify) {
+		block_t* unverified = atsc3_smime_extract_unverified_payload(atsc3_smime_validation_context->atsc3_smime_entity->raw_smime_payload);
+		if(unverified) {
+			_ATSC3_SMIME_UTILS_WARN("atsc3_smime_validate_from_context: signature not verified (no-verify requested), using signed payload as-is, len: %d", unverified->p_size);
+			atsc3_smime_validation_context->atsc3_smime_entity->cms_verified_extracted_mime_entity = unverified;
+			return atsc3_smime_validation_context;
+		}
+	}
+
+	return NULL;
 }
 
