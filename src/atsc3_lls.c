@@ -108,7 +108,18 @@ static atsc3_lls_table_t* __lls_create_base_table_raw(block_t* lls_packet_block)
                    base_table->signed_multi_table.lls_payload_count);
 
         _LLS_TRACE("__lls_create_base_table_raw: SignedMultiTable: lls_payload_count is: %d", base_table->signed_multi_table.lls_payload_count);
-        for(int i=0; i < base_table->signed_multi_table.lls_payload_count && base_table; i++) {
+        /*
+         * 2026-09-24: base_table must be null-checked *before* dereferencing
+         * it, not after - a malformed SignedMultiTable entry later in this
+         * loop can freeclean(&base_table) mid-iteration (see the "payload_length
+         * ... is too long" branch below), and the old ordering
+         * (i < base_table->... && base_table) still dereferenced the
+         * now-NULL base_table on the next iteration's condition check
+         * before ever reaching the truthiness test. Confirmed via a live
+         * segfault at __lls_create_base_table_raw+0x30 right after a
+         * freeclean() call.
+         */
+        for(int i=0; base_table && i < base_table->signed_multi_table.lls_payload_count; i++) {
             //read out lls_payload_id, lls_payload_version and lls_payload_length, and re-cast a block_T buffer for lls_payload() parsing
             atsc3_signed_multi_table_lls_payload_t* lls_payload = atsc3_signed_multi_table_lls_payload_new();
             lls_payload->lls_payload_id = block_Read_uint8(signed_multi_table_block);
@@ -859,6 +870,27 @@ int lls_create_table_type_instance(atsc3_lls_table_t* lls_table, xml_node_t* xml
         ret = build_onscreen_message_notification_table(lls_table, xml_root);
 	} else if(lls_table->lls_table_id == CertificationData) {
 		ret = atsc3_lls_build_certificationdata_table(lls_table, xml_root);
+	} else if(lls_table->lls_table_id == UserDefined) {
+		/*
+		 * 2026-09-23: UserDefined (0xFF) is a real, known ATSC3.0 LLS
+		 * table type (vendor-private content, no standard schema) -
+		 * confirmed via a raw wire capture that a live broadcaster
+		 * sends these correctly and completely intact (gzip-compressed
+		 * XML payload, embedded gzip filename literally "UserDefined").
+		 * This was previously logged as "Unknown LLS table type: 255"
+		 * on every single occurrence, wrongly implying data corruption
+		 * or loss when the transport delivered it perfectly.
+		 *
+		 * NOT building/accepting it here (ret stays -1, same as the
+		 * "unknown" path) is deliberate: doing so once (ret=0) let
+		 * this table flow through the same success path SLT/RRT/etc.
+		 * use, which segfaulted somewhere downstream in code that had
+		 * never been exercised for this table type before and isn't
+		 * safe to debug blind (no accessible core dump, no symbols).
+		 * Fully wiring up UserDefined delivery needs that downstream
+		 * path audited first - this only fixes the misleading log.
+		 */
+		_LLS_TRACE("lls_create_table_type_instance: LLS table UserDefined recognized but not yet built (vendor-private content, no standard schema)");
 	} else {
 		_LLS_ERROR("lls_create_table_type_instance: Unknown LLS table type: %d",  lls_table->lls_table_id);
 	}

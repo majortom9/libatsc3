@@ -49,3 +49,13 @@
 /stderr
 /atsc3_mmt_signalling_message_test
 /src_html/
+
+# 2026-09-22: gaps found when setting up real git tracking for the first time
+/tools/atsc3_listener_metrics_ncurses
+/tools/atsc3_listener_metrics_ncurses_httpd_isobmff
+debug.log.*
+*.o
+/Debug/
+/atsc3_mmt_listener_test_bento
+/atsc3_mmt_sls_listener_test
+/atsc3_isobmff_box_testatsc3_isobmff_box_test

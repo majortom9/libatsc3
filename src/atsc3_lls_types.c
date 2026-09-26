@@ -516,7 +516,33 @@ void atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects
 							}
 
 							//jjustman: TODO: 2020-08-04 - flag objects with no length...
-							if(!atsc3_route_object->object_length || computed_payload_received_size < atsc3_route_object->object_length) {
+							/*
+							 * 2026-09-21: this used to be gated on
+							 * "computed_payload_received_size < object_length"
+							 * (i.e. only objects that are actually short by byte
+							 * count). Real over-the-air testing on service 5001
+							 * found a large, systematic class of objects where
+							 * computed_payload_received_size >= object_length
+							 * (fully byte-complete, occasionally *more* than
+							 * expected - lct_packets_received one over expected,
+							 * suggesting a duplicate/retransmitted packet) but
+							 * atsc3_route_object_is_complete()'s own structural
+							 * check never independently confirmed it and set
+							 * recovery_complete_timestamp. Previously that fell
+							 * into a separate branch that only logged "STALE
+							 * route object?" and did nothing else - no persist
+							 * attempt, no should_free_and_unlink - so the object
+							 * leaked forever, never written to disk. Confirmed
+							 * live: near-zero video fragments actually reaching
+							 * disk for an entire session despite continuous ALC
+							 * activity. The real, correct condition is just
+							 * "was this object ever confirmed complete through
+							 * the normal path by give-up time" - if not, always
+							 * attempt the same best-effort persist regardless of
+							 * whether the byte count came in under, at, or over
+							 * 100%.
+							 */
+							if(!atsc3_route_object->recovery_complete_timestamp) {
 
 								//2026-09-20: before giving up entirely (genuinely no more packets are
 								//coming - this is _ATSC3_LLS_SLS_ALC_MONITOR_LCT_PACKETS_GIVEN_UP_SECONDS
@@ -631,17 +657,6 @@ void atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects
 										computed_payload_received_size,
 										atsc3_route_object->atsc3_route_object_lct_packet_received_v.count,
 										atsc3_route_object->expected_route_object_lct_packet_count);
-							} else if(!atsc3_route_object->recovery_complete_timestamp) {
-								_ATSC3_LLS_TYPES_WARN("atsc3_lls_sls_alc_monitor_check_all_s_tsid_flows_has_given_up_route_objects: STALE rotue object? give_up candidate route_object: %p, given up timestamp: %.4f (delta: %.4f), tsi: %d, toi: %d, object_length: %d, computed_payload_received_size: %d, lct_packets_received: %d, expected: %d",
-																		atsc3_route_object,
-																		atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received->most_recent_received_timestamp / 1000.0,
-																		(now - atsc3_route_object->most_recent_atsc3_route_object_lct_packet_received->most_recent_received_timestamp) / 1000.0,
-																		atsc3_route_object->tsi,
-																		atsc3_route_object->toi,
-																		atsc3_route_object->object_length,
-																		computed_payload_received_size,
-																		atsc3_route_object->atsc3_route_object_lct_packet_received_v.count,
-																		atsc3_route_object->expected_route_object_lct_packet_count);
 							}
 						}
 					}

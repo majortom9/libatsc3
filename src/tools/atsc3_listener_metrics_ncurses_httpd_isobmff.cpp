@@ -368,6 +368,24 @@ void* route_file_watcher_run_thread(void* p) {
 
     std::string init_path = std::string(dir_path) + "/" + prefix + "init.mp4";
 
+    /*
+     * 2026-09-25: briefly rewrote this to watch a completely different
+     * output path (lls_sls_monitor_output_buffer_alc_file_dump()'s flat
+     * route/<seq>.a|.v files) after finding that alc_file_dump() call site
+     * gated on has_written_init_box/should_flush_output_buffer, which are
+     * never set true anywhere in this codebase. Reverted: that bridge was
+     * ALREADY known-dead per the 2026-09-20 comment below this function -
+     * the ACTUAL working writer is
+     * atsc3_alc_packet_persist_to_toi_resource_process_sls_mbms_and_emit_callback,
+     * which does write real route/<service_id>/<prefix><TOI>.<ext> files
+     * matching exactly what this original logic already watches for. The
+     * reason ATSC3_AUTOPLAY_TRACK_PREFIX=video- never produces anything is
+     * upstream of this watcher: video objects on this mux arrive ~2-3%
+     * short of complete and so never reach "complete" for any writer to
+     * persist. The shortfall is NOT settled as broadcast loss - the vendor
+     * app plays this mux cleanly, and atsc3-player.py's missing objects
+     * turned out to be its own reassembly bug - so still investigate.
+     */
     __INFO("route_file_watcher_run_thread: watching dir: %s, prefix: %s, waiting for init segment: %s",
            dir_path, prefix.c_str(), init_path.c_str());
 

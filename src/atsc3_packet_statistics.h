@@ -209,6 +209,17 @@ typedef struct global_atsc3_stats {
 	uint32_t packets_total_received;
 
 	struct timeval program_timeval_start;
+
+	//2026-09-22: set by atsc3_listener_metrics_ncurses_httpd_isobmff's
+	//route_file_watcher threads once each HTTP endpoint has actually pushed
+	//its first init segment (i.e. is genuinely ready for a remote player to
+	//connect) - unused/always false for any other tool. Displayed persistently
+	//in the Global stats pane rather than a one-off message, since that pane
+	//is fully redrawn every second anyway.
+	bool video_endpoint_ready;
+	int video_endpoint_port;
+	bool audio_endpoint_ready;
+	int audio_endpoint_port;
 } atsc3_global_statistics_t;
 
 extern atsc3_global_statistics_t* atsc3_global_statistics;

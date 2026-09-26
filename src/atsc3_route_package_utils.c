@@ -272,7 +272,11 @@ void atsc3_route_package_extract_payload_metadata_dump(atsc3_route_package_extra
 
 
 
-	__ROUTE_PACKAGE_UTILS_DEBUG("raw XML envelope:\n%s", atsc3_route_package_extracted_envelope_metadata_and_payload->atsc3_mbms_metadata_envelope_raw_xml->p_buffer);
+	if(atsc3_route_package_extracted_envelope_metadata_and_payload->atsc3_mbms_metadata_envelope_raw_xml) {
+		__ROUTE_PACKAGE_UTILS_DEBUG("raw XML envelope:\n%s", atsc3_route_package_extracted_envelope_metadata_and_payload->atsc3_mbms_metadata_envelope_raw_xml->p_buffer);
+	} else {
+		__ROUTE_PACKAGE_UTILS_ERROR("atsc3_mbms_metadata_envelope_raw_xml is NULL!");
+	}
 	__ROUTE_PACKAGE_UTILS_DEBUG("---");
 	for(int i=0; i < atsc3_route_package_extracted_envelope_metadata_and_payload->atsc3_mime_multipart_related_payload_v.count; i++) {
 		atsc3_mime_multipart_related_payload_t* atsc3_mime_multipart_related_payload = atsc3_route_package_extracted_envelope_metadata_and_payload->atsc3_mime_multipart_related_payload_v.data[i];

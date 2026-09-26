@@ -7,6 +7,7 @@
 
 #include "atsc3_listener_udp.h"
 #include "atsc3_packet_statistics.h"
+#include "atsc3_logging_externs.h"
 
 int global_mmt_loss_count;
 bool __LOSS_DISPLAY_ENABLED = true;
@@ -395,6 +396,21 @@ void atsc3_packet_statistics_dump_global_stats(){
 	gettimeofday(&tNow, NULL);
 	long long elapsedDurationUs = timediff(tNow, atsc3_global_statistics->program_timeval_start);
 	__PS_STATS_GLOBAL("Elapsed Duration            : %-.2fs", elapsedDurationUs / 1000000.0);
+	__PS_STATS_GLOBAL("");
+	//2026-09-22: persistent (redrawn every second, not a one-off flash) ready
+	//indicator for the video/audio HTTP endpoints - a remote player connecting
+	//before the first init segment is actually pushed will just block waiting
+	//for data, so this tells you when it's actually safe to try.
+	if(atsc3_global_statistics->video_endpoint_ready) {
+		__PS_STATS_GLOBAL("VIDEO: READY on port %d", atsc3_global_statistics->video_endpoint_port);
+	} else {
+		__PS_STATS_GLOBAL("VIDEO: waiting for first init segment...");
+	}
+	if(atsc3_global_statistics->audio_endpoint_ready) {
+		__PS_STATS_GLOBAL("AUDIO (AC4): READY on port %d", atsc3_global_statistics->audio_endpoint_port);
+	} else {
+		__PS_STATS_GLOBAL("AUDIO (AC4): waiting for first init segment...");
+	}
 	__PS_STATS_GLOBAL("");
 	__PS_STATS_GLOBAL("LLS total packets received  : %'-u", atsc3_global_statistics->packet_counter_lls_packets_received);
 	__PS_STATS_GLOBAL("> parsed good               : %'-u", atsc3_global_statistics->packet_counter_lls_packets_parsed);

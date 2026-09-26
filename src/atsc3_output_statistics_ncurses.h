@@ -118,8 +118,16 @@ extern 	WINDOW* pkt_global_loss_window;
 #define __PS_STATS_GLOBAL(...) 		wprintw(pkt_global_stats_window, __VA_ARGS__); \
 									wprintw(pkt_global_stats_window,"\n");
 
+//2026-09-22: this window is fixed-height with scrolling disabled, so any
+//flow whose full stat block doesn't fit before the next 1-second __PS_CLEAR()
+//redraw is only ever visible for a fraction of a second - confirmed user-
+//reported symptom ("messages pop up for an instant then disappear"). Also
+//emit to the debug log (same __INFO sink as the rest of this codebase) so
+//every line is reviewable afterward regardless of what the TUI had room to
+//show.
 #define __PS_STATS_FLOW(...) 		wprintw(pkt_flow_stats_mmt_window, __VA_ARGS__); \
-									wprintw(pkt_flow_stats_mmt_window,"\n");
+									wprintw(pkt_flow_stats_mmt_window,"\n"); \
+									__INFO(__VA_ARGS__);
 
 #define __PS_STATS_FLOW_W(...) 		wprintw(pkt_flow_stats_mmt_window, __VA_ARGS__);
 
