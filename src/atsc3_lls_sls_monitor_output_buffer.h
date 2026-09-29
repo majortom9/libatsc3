@@ -110,6 +110,12 @@ typedef struct http_output_buffer {
 
 	sig_atomic_t writer_unlock_count;
 
+	//bumped each time an HTTP client starts reading, so the writer knows to
+	//send that client the init segment first; http_output_conntected is true
+	//while http_output_clients > 0. Both guarded by http_payload_buffer_mutex.
+	uint32_t http_output_connection_id;
+	int32_t  http_output_clients;
+
 } http_output_buffer_t;
 
 typedef struct lls_sls_monitor_buffer_mode {

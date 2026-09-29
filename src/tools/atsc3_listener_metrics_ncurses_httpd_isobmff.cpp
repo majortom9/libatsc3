@@ -133,8 +133,47 @@ static lls_sls_monitor_output_buffer_mode_t* get_active_output_buffer_mode() {
 	return NULL;
 }
 
+//One per HTTP response (= per client connection). A client that disconnects
+//used to leave its half-sent block and the next queued fragment in the
+//one-slot mailbox, and the writer only re-sent the init segment if it
+//happened to run while nobody was connected - so a client reconnecting
+//(same URL, same command) got the tail of an old fragment and no init
+//segment, and couldn't play. Now each new client clears the leftovers and
+//bumps http_output_connection_id, and the writer primes every new id.
+typedef struct http_output_client {
+	http_output_buffer_t* http_output_buffer; //NULL: resolve the ALC/MMT monitor's (video) buffer
+	http_output_buffer_t* counted_in;         //buffer this client was counted into, once reading
+} http_output_client_t;
+
+static http_output_buffer_t* http_output_client_buffer(http_output_client_t* client) {
+	if(client->http_output_buffer) {
+		return client->http_output_buffer;
+	}
+	lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
+	return output_buffer_mode ? output_buffer_mode->http_output_buffer : NULL;
+}
+
+//first read of a new client: drop what the previous client left behind
+static void http_output_client_start(http_output_client_t* client, http_output_buffer_t* http_output_buffer) {
+	lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
+	if(http_output_buffer->http_payload_buffer_client_output) {
+		block_Release(&http_output_buffer->http_payload_buffer_client_output);
+	}
+	if(http_output_buffer->http_payload_buffer_incoming) {
+		block_Release(&http_output_buffer->http_payload_buffer_incoming);
+	}
+	http_output_buffer->http_output_connection_id++;
+	http_output_buffer->http_output_clients++;
+	http_output_buffer->http_output_conntected = true;
+	client->counted_in = http_output_buffer;
+	__INFO("http_output_client_start: %p: connection %u, clients: %d", http_output_buffer,
+			http_output_buffer->http_output_connection_id, http_output_buffer->http_output_clients);
+	lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
+}
+
 static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls, uint64_t pos, char *buf, size_t max)
 {
+	http_output_client_t* client = (http_output_client_t*)cls;
 	/*
 	 * 2026-09-20: this used to `return 0` from every "no data yet" branch
 	 * below. libmicrohttpd's content-reader callback has no defined
@@ -154,25 +193,16 @@ static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls,
 	while(true) {
 		__INFO("http_output_response_from_player_pipe_reader_callback: enter: pos: %"PRIu64", buf: %p, max_size: %lu", pos, buf, max);
 
-		http_output_buffer_t* http_output_buffer = (http_output_buffer_t*)cls;
+		http_output_buffer_t* http_output_buffer = http_output_client_buffer(client);
 		if(!http_output_buffer) {
-			lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
-
-			if(!output_buffer_mode) {
-				__WARN("http_output_response_from_player_pipe_reader_callback: no active ALC or MMT monitor yet");
-				//sleep so we don't spinlock too fast
-				usleep(100000);
-				continue;
-			}
-			http_output_buffer = output_buffer_mode->http_output_buffer;
-		}
-		if(!http_output_buffer) {
-			__WARN("http_output_response_from_player_pipe_reader_callback: not http_output_buffer yet");
+			__WARN("http_output_response_from_player_pipe_reader_callback: no active ALC or MMT monitor / http_output_buffer yet");
 			//sleep so we don't spinlock too fast
 			usleep(100000);
 			continue;
 		}
-		http_output_buffer->http_output_conntected = true;
+		if(!client->counted_in) {
+			http_output_client_start(client, http_output_buffer);
+		}
 		if(!http_output_buffer->http_payload_buffer_client_output &&
 				!http_output_buffer->http_payload_buffer_incoming) {
 			__WARN("http_output_response_from_player_pipe_reader_callback: both buffers are null, retrying");
@@ -249,17 +279,20 @@ static ssize_t http_output_response_from_player_pipe_reader_callback (void *cls,
 
 static void http_output_response_from_player_pipe_reader_free_callback (void *cls)
 {
-	http_output_buffer_t* http_output_buffer = (http_output_buffer_t*)cls;
-	if(!http_output_buffer) {
-		lls_sls_monitor_output_buffer_mode_t* output_buffer_mode = get_active_output_buffer_mode();
-		if(output_buffer_mode) {
-			http_output_buffer = output_buffer_mode->http_output_buffer;
-		}
-	}
+	http_output_client_t* client = (http_output_client_t*)cls;
+	http_output_buffer_t* http_output_buffer = client->counted_in;
+	//only count out a client that was counted in; a late free for an old
+	//connection must not mark a newer, still-connected client as gone
 	if(http_output_buffer) {
-		http_output_buffer->http_output_conntected = false;
+		lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
+		if(http_output_buffer->http_output_clients > 0) {
+			http_output_buffer->http_output_clients--;
+		}
+		http_output_buffer->http_output_conntected = http_output_buffer->http_output_clients > 0;
+		lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
 	}
-	__INFO("http_output_response_from_player_pipe_reader_free_callback: closing: %p", cls);
+	__INFO("http_output_response_from_player_pipe_reader_free_callback: closing: %p", http_output_buffer);
+	free(client);
 }
 
 
@@ -287,12 +320,18 @@ static enum MHD_Result http_output_response_from_player_pipe (void *cls,
 	return MHD_NO;              /* unexpected method */
 
 	//cls is this daemon's http_output_buffer_t (NULL for the video/monitor one)
+	http_output_client_t* client = (http_output_client_t*)calloc(1, sizeof(http_output_client_t));
+	if(!client) {
+		return MHD_NO;
+	}
+	client->http_output_buffer = (http_output_buffer_t*)cls;
   	response = MHD_create_response_from_callback (MHD_SIZE_UNKNOWN, 512 * 1024,     /* 512k page size */
                                                     &http_output_response_from_player_pipe_reader_callback,
-                                                    cls,
+                                                    client,
                                                     &http_output_response_from_player_pipe_reader_free_callback);
 
 	if (NULL == response){
+		free(client);
 		return MHD_NO;
 	}
 	MHD_add_response_header(response, "Content-Type", cls ? MIMETYPE_AUDIO : MIMETYPE);
@@ -323,17 +362,20 @@ typedef struct route_file_watcher_track {
     //init segment kept so an HTTP client that connects later is given it first
     block_t*              init_block;
     bool                  http_primed;
+    uint32_t              http_connection_id; //client connection the priming was for
 } route_file_watcher_track_t;
 
-static route_file_watcher_track_t route_file_watcher_video_track = { "video", "", true, NULL, NULL, false };
-static route_file_watcher_track_t route_file_watcher_audio_track = { "audio", "", false, &audio_http_output_buffer, NULL, false };
+static route_file_watcher_track_t route_file_watcher_video_track = { "video", "", true, NULL, NULL, false, 0 };
+static route_file_watcher_track_t route_file_watcher_audio_track = { "audio", "", false, &audio_http_output_buffer, NULL, false, 0 };
 
 //hand a block to the connected client's one-slot mailbox once the previous
-//one is consumed; false if no client is (or stays) connected
-static bool route_file_watcher_http_slot_push(http_output_buffer_t* http_output_buffer, block_t* content_block) {
+//one is consumed; false if no client is (or stays) connected, or if a new
+//client connected meanwhile (it has to get the init segment first)
+static bool route_file_watcher_http_slot_push(http_output_buffer_t* http_output_buffer, block_t* content_block, uint32_t connection_id) {
     while(true) {
         lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
-        bool connected = http_output_buffer->http_output_conntected;
+        bool connected = http_output_buffer->http_output_conntected &&
+                         http_output_buffer->http_output_connection_id == connection_id;
         bool slot_free = connected && !http_output_buffer->http_payload_buffer_incoming;
         if(slot_free) {
             http_output_buffer->http_payload_buffer_incoming = block_Duplicate(content_block);
@@ -380,11 +422,19 @@ static void route_file_watcher_push_block_to_outputs(route_file_watcher_track_t*
         if(!http_output_buffer->http_output_conntected) {
             track->http_primed = false;
         } else {
+            lls_sls_monitor_reader_mutex_lock(http_output_buffer->http_payload_buffer_mutex);
+            uint32_t connection_id = http_output_buffer->http_output_connection_id;
+            lls_sls_monitor_reader_mutex_unlock(http_output_buffer->http_payload_buffer_mutex);
+            //a new client (e.g. the same player reconnecting) needs the init segment again
+            if(track->http_connection_id != connection_id) {
+                track->http_primed = false;
+                track->http_connection_id = connection_id;
+            }
             if(!track->http_primed && track->init_block) {
-                track->http_primed = route_file_watcher_http_slot_push(http_output_buffer, track->init_block);
+                track->http_primed = route_file_watcher_http_slot_push(http_output_buffer, track->init_block, connection_id);
             }
             if(track->http_primed && content_block != track->init_block) {
-                if(!route_file_watcher_http_slot_push(http_output_buffer, content_block)) {
+                if(!route_file_watcher_http_slot_push(http_output_buffer, content_block, connection_id)) {
                     track->http_primed = false;
                 }
             }
